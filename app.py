@@ -1,38 +1,46 @@
-"""Code Mover — Streamlit UI for safe patch-based code transfer.
+"""Code Mover — Streamlit UI for safe git-based code transfer.
 
-Supports:
-- Multi-repo management with config
-- Two-sided workflow (generate patch on side A, apply on side B)
-- Tree fingerprint validation for cross-side safety
-- Tamper detection (file hash comparison)
-- Patch history with before/after snapshots
-- ZIP export/import for easy transfer
+Workflow:
+  Side A (sender)  — has git + LLM access. Generates a git format-patch
+                     covering all commits since the last synced commit.
+  Side B (receiver)— isolated environment. Receives the patch and applies
+                     it with 'git am', preserving commit history.
+
+Sync state (last synced commit hash) is stored in
+  _code_mover_patches/sync.json
+inside each repository.
 """
 
 import streamlit as st
 from pathlib import Path
-import yaml
+from datetime import datetime
 
 from core import (
+    # Repo
     find_repo_root,
-    validate_patch,
-    build_preview_diff,
-    apply_patch,
-    generate_patch,
-    generate_changes_from_zip_diff,
-    compute_tree_fingerprint,
-    compute_file_structure_snapshot,
-    compute_file_hashes,
-    detect_changes_since_last_patch,
     validate_repo_markers,
+    check_is_git_repo,
+    compute_file_structure_snapshot,
+    # Git state
+    get_current_commit,
+    get_commits_since,
+    get_uncommitted_files,
+    # Sync state
+    load_sync_state,
+    save_sync_state,
+    # Patch generation / application
+    generate_format_patch,
+    preview_format_patch,
+    apply_format_patch,
+    # ZIP
     export_patch_to_zip,
     import_patch_from_zip,
+    # History
+    add_to_history,
     get_patch_history_summary,
-    add_patch_to_history,
 )
 from config import (
     load_config,
-    save_config,
     set_side,
     get_side,
     add_repo,
@@ -44,45 +52,34 @@ from config import (
 
 st.set_page_config(page_title="Code Mover", layout="wide")
 st.title("📦 Code Mover")
-st.caption("Safe patch-based code transfer for isolated environments")
+st.caption("Git-based code transfer for isolated environments")
 
 
-# ─── Initialize session state ──────────────────────────────────────────
+# ─── Session state ──────────────────────────────────────────────────────
 
-if "validated_patch" not in st.session_state:
-    st.session_state["validated_patch"] = None
 if "generated_patch" not in st.session_state:
-    st.session_state["generated_patch"] = None
-if "change_list" not in st.session_state:
-    st.session_state["change_list"] = []
-if "pending_changes" not in st.session_state:
-    st.session_state["pending_changes"] = None
+    st.session_state["generated_patch"] = None      # raw patch text
+if "generated_meta" not in st.session_state:
+    st.session_state["generated_meta"] = {}         # metadata dict
 if "repo_form_name" not in st.session_state:
     st.session_state["repo_form_name"] = ""
 if "repo_form_path" not in st.session_state:
     st.session_state["repo_form_path"] = ""
 
 
-# ─── Sidebar: Configuration ────────────────────────────────────────────
+# ─── Sidebar ────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("⚙️ Konfigurasjon")
-
     config = load_config()
 
-    # ── Side selector with clear description ──
+    # ── Side selector ──
     current_side = config.get("side", "a")
-
     side_labels = {
-        "a": "📤 **Side A — Avsender**\nGenerer patcher for overføring til B",
-        "b": "📥 **Side B — Mottaker**\nMottar og applicerer patcher fra A",
+        "a": "📤 **Side A — Avsender**\nHar git + LLM-tilgang. Genererer patcher.",
+        "b": "📥 **Side B — Mottaker**\nIsolert miljø. Mottar og appliserer patcher.",
     }
-
     st.markdown("### 🔀 Hvilken side er dette?")
-    st.caption(
-        "**Side A** har tilgang til LLM/eksterne verktøy og genererer patcher.\n\n"
-        "**Side B** er det isolerte miljøet som mottar og applicerer patcher."
-    )
 
     new_side = st.radio(
         "Velg side",
@@ -93,31 +90,27 @@ with st.sidebar:
     )
 
     if new_side != current_side:
-        # Safety: warn when switching from B (receiver) to A (sender)
         if current_side == "b" and new_side == "a":
             st.warning(
-                "⚠️ **OBS!** Du bytter fra **mottaker (B)** til **avsender (A)**.\n\n"
-                "Før du genererer nye patcher, må du være sikker på at repoet på "
-                "denne siden er **fullstendig i sync** med det som ble sendt til B. "
-                "Hvis ikke vil patcher du genererer være basert på utdatert kode."
+                "⚠️ Du bytter fra **mottaker (B)** til **avsender (A)**.\n\n"
+                "Pass på at repoet er synkronisert med B før du genererer nye patcher."
             )
-            col_confirm_yes, col_confirm_no = st.columns(2)
-            with col_confirm_yes:
-                if st.button("✅ Ja, jeg bekrefter sync", use_container_width=True):
-                    config = set_side(new_side)
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("✅ Bekreft", use_container_width=True):
+                    set_side(new_side)
                     st.rerun()
-            with col_confirm_no:
+            with col_no:
                 if st.button("❌ Avbryt", use_container_width=True):
                     st.rerun()
         else:
-            config = set_side(new_side)
+            set_side(new_side)
             st.rerun()
 
     st.divider()
 
-    # Active repo selector
+    # ── Active repo ──
     st.subheader("📂 Aktivt repo")
-
     repo_names = [r["name"] for r in config.get("repos", [])]
     active_repo = get_active_repo()
 
@@ -129,54 +122,47 @@ with st.sidebar:
             except ValueError:
                 active_index = 0
 
-        selected_repo = st.selectbox(
-            "Velg repo",
-            options=repo_names,
-            index=active_index,
-            key="repo_selector",
+        selected = st.selectbox(
+            "Velg repo", options=repo_names, index=active_index, key="repo_selector"
         )
-
-        if selected_repo != (active_repo["name"] if active_repo else None):
-            set_active_repo(selected_repo)
+        if selected != (active_repo["name"] if active_repo else None):
+            set_active_repo(selected)
             st.rerun()
     else:
-        st.info("Ingen repoer registrert. Legg til et repo nedenfor.")
+        st.info("Ingen repoer registrert.")
 
-    # Show active repo info
     active_repo = get_active_repo()
     if active_repo:
         repo_path = Path(active_repo["path"])
-        st.success(f"✅ Aktivt: **{active_repo['name']}**")
+        st.success(f"✅ **{active_repo['name']}**")
         st.caption(f"`{repo_path}`")
 
-        # Validate markers
-        missing = validate_repo_markers(
-            repo_path, active_repo.get("markers", ["app.py", "core.py"])
-        )
+        missing = validate_repo_markers(repo_path, active_repo.get("markers", ["app.py", "core.py"]))
         if missing:
             st.warning(f"⚠️ Mangler markører: {', '.join(missing)}")
         else:
             st.caption("✅ Alle markører funnet")
 
-        # Show fingerprint
-        fp = compute_tree_fingerprint(repo_path)
-        st.caption(f"🔑 Fingeravtrykk: `{fp}`")
+        if check_is_git_repo(repo_path):
+            try:
+                head = get_current_commit(repo_path)
+                st.caption(f"🔖 HEAD: `{head[:12]}`")
+            except Exception:
+                pass
 
-        # Tamper detection: check for changes since last patch
-        changes_since = detect_changes_since_last_patch(repo_path)
-        if changes_since:
-            with st.expander("⚠️ Endringer siden siste patch", expanded=True):
-                for c in changes_since:
-                    icon = {"new": "🆕", "modified": "✏️", "deleted": "🗑️"}.get(
-                        c["type"], "❓"
-                    )
-                    st.write(f"{icon} `{c['file']}` ({c['type']})")
+            sync = load_sync_state(repo_path)
+            last_sync = sync.get("last_synced_commit")
+            if last_sync:
+                st.caption(f"🔗 Sist synket: `{last_sync[:12]}`")
+                st.caption(f"📅 {sync.get('synced_at', '?')}")
+            else:
+                st.caption("🔗 Ikke synket ennå")
         else:
-            st.caption("✅ Ingen endringer siden siste patch")
+            st.warning("⚠️ Ikke et git-repo")
 
     st.divider()
 
-    # Repo management expander
+    # ── Repo management ──
     with st.expander("➕ Legg til / fjern repo"):
         if st.button("🔍 Søk etter repoer", use_container_width=True):
             with st.spinner("Søker..."):
@@ -186,38 +172,31 @@ with st.sidebar:
                 for r in found:
                     col_a, col_b, col_c = st.columns([2, 3, 1])
                     with col_a:
-                        git_icon = "📁" if r.get("has_git") else "📂"
-                        st.write(f"{git_icon} **{r['name']}**")
+                        st.write(f"{'📁' if r.get('has_git') else '📂'} **{r['name']}**")
                     with col_b:
                         st.caption(f"`{r['path']}`")
                     with col_c:
-                        if st.button(f"✅ Legg til", key=f"add_{r['name']}"):
+                        if st.button("✅", key=f"add_{r['name']}"):
                             add_repo(r["name"], r["path"])
                             set_active_repo(r["name"])
                             st.rerun()
             else:
-                st.warning("Ingen repoer funnet. Prøv å legge til manuelt.")
+                st.warning("Ingen repoer funnet. Legg til manuelt.")
 
         st.divider()
 
         with st.form("add_repo_form"):
-            prefill_name = st.session_state.get("repo_form_name", "")
-            prefill_path = st.session_state.get("repo_form_path", "")
-
             new_name = st.text_input(
                 "Repo-navn",
-                value=prefill_name,
-                placeholder="F.eks. fleet-manager",
+                value=st.session_state.get("repo_form_name", ""),
+                placeholder="fleet-manager",
             )
             new_path = st.text_input(
                 "Sti (absolutt)",
-                value=prefill_path,
-                placeholder="F.eks. /Users/bruker/Documents/GitHub/fleet-manager",
+                value=st.session_state.get("repo_form_path", ""),
+                placeholder="/Users/bruker/Documents/GitHub/fleet-manager",
             )
-            new_markers = st.text_input(
-                "Markører (kommaseparert)", value="app.py, core.py"
-            )
-
+            new_markers = st.text_input("Markører (kommaseparert)", value="app.py, core.py")
             if st.form_submit_button("💾 Lagre repo", use_container_width=True):
                 if new_name and new_path:
                     markers = [m.strip() for m in new_markers.split(",") if m.strip()]
@@ -230,352 +209,323 @@ with st.sidebar:
 
         if repo_names:
             st.divider()
-            repo_to_remove = st.selectbox(
-                "Fjern repo",
-                options=[""] + repo_names,
-                key="remove_repo_selector",
-            )
-            if repo_to_remove and st.button(
-                "🗑️ Fjern", type="secondary", use_container_width=True
-            ):
-                remove_repo(repo_to_remove)
+            to_remove = st.selectbox("Fjern repo", options=[""] + repo_names, key="remove_selector")
+            if to_remove and st.button("🗑️ Fjern", type="secondary", use_container_width=True):
+                remove_repo(to_remove)
                 st.rerun()
 
 
-# ─── Main content area ─────────────────────────────────────────────────
+# ─── Guard: must have active repo ───────────────────────────────────────
 
-# Check that we have an active repo
 active_repo = get_active_repo()
 if not active_repo:
-    st.warning(
-        "⚠️ Ingen repo valgt. "
-        "Gå til sidemenyen for å legge til og velge et repo."
-    )
+    st.warning("⚠️ Ingen repo valgt. Gå til sidemenyen for å legge til og velge et repo.")
     st.stop()
 
-repo_root = Path(active_repo["path"])
+repo_root   = Path(active_repo["path"])
 current_side = get_side()
 
-# Show different tabs depending on which side we are
+if not check_is_git_repo(repo_root):
+    st.error("❌ Det valgte repoet er ikke et git-repo. Code Mover krever git.")
+    st.stop()
+
+
+# ─── Tabs ───────────────────────────────────────────────────────────────
+
 if current_side == "a":
-    # Side A (sender): Generate patch from diff + History
-    tab_status, tab_history = st.tabs(
-        ["📤 Generer patch fra diff", "📜 Historikk"]
-    )
+    tab_generate, tab_history = st.tabs(["📤 Generer patch", "📜 Historikk"])
 else:
-    # Side B (receiver): Apply patch + History
-    tab_apply, tab_history = st.tabs(
-        ["📥 Apply patch", "📜 Historikk"]
-    )
+    tab_apply, tab_history = st.tabs(["📥 Apply patch", "📜 Historikk"])
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# TAB: APPLY PATCH (only on Side B)
-# ═══════════════════════════════════════════════════════════════════════
-
-if current_side == "b":
-    with tab_apply:
-        st.subheader("📥 Apply patch fra den andre siden")
-
-        st.info(
-            f"Du er på **side {current_side.upper()}**. "
-            f"Lim inn en patch generert på side A."
-        )
-
-        # Two input methods: paste YAML or upload ZIP
-        input_method = st.radio(
-            "Inndatametode",
-            options=["📋 Lim inn YAML", "📁 Last opp ZIP"],
-            horizontal=True,
-        )
-
-        patch_text = ""
-        source_file_hashes = None
-        zip_metadata = None
-
-        if input_method == "📋 Lim inn YAML":
-            patch_text = st.text_area(
-                "📋 Lim inn YAML-patch",
-                height=300,
-                placeholder="Lim inn YAML-patch her...",
-                key="apply_patch_input",
-            )
-        else:
-            uploaded_file = st.file_uploader(
-                "📁 Last opp .zip-fil",
-                type=["zip"],
-                help="Last opp en ZIP-fil generert fra den andre siden",
-            )
-            if uploaded_file is not None:
-                try:
-                    zip_bytes = uploaded_file.getvalue()
-                    patch_text, source_file_hashes, zip_metadata = import_patch_from_zip(
-                        zip_bytes
-                    )
-
-                    # Show ZIP metadata
-                    with st.expander("📄 ZIP-metadata", expanded=True):
-                        st.json(zip_metadata)
-
-                    st.success(
-                        f"✅ ZIP lastet inn: {len(patch_text)} bytes YAML, "
-                        f"{len(source_file_hashes)} filhasher"
-                    )
-                except Exception as e:
-                    st.error(f"❌ Kunne ikke lese ZIP-fil: {e}")
-
-        col_validate, col_apply = st.columns(2)
-
-        with col_validate:
-            if st.button("🔍 Valider patch", use_container_width=True):
-                if not patch_text.strip():
-                    st.error("❌ Lim inn en patch eller last opp ZIP først")
-                else:
-                    try:
-                        patch = validate_patch(
-                            patch_text,
-                            repo_root,
-                            expected_side=current_side,
-                            source_file_hashes=source_file_hashes,
-                        )
-                        diff = build_preview_diff(patch, repo_root)
-
-                        st.session_state["validated_patch"] = patch
-
-                        # Show patch metadata
-                        with st.expander("📄 Patch-metadata", expanded=True):
-                            st.write(f"**Kilde-side:** {patch.get('source_side', '?')}")
-                            st.write(f"**Generert:** {patch.get('generated_at', '?')}")
-                            st.write(
-                                f"**Beskrivelse:** {patch.get('description', '—')}"
-                            )
-                            st.write(
-                                f"**Fingeravtrykk:** `{patch.get('source_tree_fingerprint', '?')}`"
-                            )
-                            st.write(
-                                f"**Endringer:** {len(patch.get('changes', []))} stk"
-                            )
-
-                        # Show tree structure for visual verification
-                        tree = patch.get("source_tree_structure", "")
-                        if tree:
-                            with st.expander("🌳 Kilde-repo trestruktur"):
-                                st.code(tree, language="")
-
-                        # Show diff
-                        st.code(diff, language="diff")
-                        st.success("✅ Patch validert. Klar til apply.")
-
-                    except Exception as e:
-                        st.error(f"❌ Validering feilet: {e}")
-                        st.session_state["validated_patch"] = None
-
-        with col_apply:
-            if st.button(
-                "🚀 Apply patch", use_container_width=True, type="primary"
-            ):
-                patch = st.session_state.get("validated_patch")
-
-                if not patch:
-                    st.error("❌ Patch må valideres først.")
-                else:
-                    try:
-                        apply_patch(patch, repo_root)
-                        st.success("✅ Patch applied!")
-                        st.balloons()
-                        st.session_state["validated_patch"] = None
-                    except Exception as e:
-                        st.error(f"❌ Apply feilet: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# TAB: GENERER FRA DIFF (only on Side A)
+# SIDE A — Generate
 # ═══════════════════════════════════════════════════════════════════════
 
 if current_side == "a":
-    with tab_status:
-        st.subheader("📤 Generer patch for overføring til B")
+    with tab_generate:
+        st.subheader("📤 Generer patch fra git-historikk")
 
-        # ── Option 1: Upload baseline ZIP ──
-        uploaded_baseline_zip = st.file_uploader(
-            "📁 Last opp baseline-ZIP (valgfritt)",
-            type=["zip"],
-            key="baseline_zip_uploader",
-            help="Last opp en ZIP-fil (tidligere eksportert fra Code Mover) "
-                 "for å sammenligne med repoet. Uten ZIP sendes alle filer.",
+        # ── Git status ──────────────────────────────────────────────────
+        try:
+            head_hash   = get_current_commit(repo_root)
+            sync_state  = load_sync_state(repo_root)
+            last_sync   = sync_state.get("last_synced_commit")
+        except Exception as e:
+            st.error(f"❌ Klarte ikke å lese git-status: {e}")
+            st.stop()
+
+        # Warn about uncommitted changes
+        dirty = get_uncommitted_files(repo_root)
+        if dirty:
+            with st.expander(f"⚠️ {len(dirty)} ucommittede endringer", expanded=True):
+                for f in dirty:
+                    st.write(f"`{f['status']}` {f['path']}")
+            st.warning(
+                "Disse endringene er **ikke** med i patchen. "
+                "Commit dem på Side A før du genererer."
+            )
+
+        # ── Show commits to be patched ──────────────────────────────────
+        if last_sync:
+            st.caption(f"Sist synket commit: `{last_sync[:12]}`")
+            try:
+                commits_to_patch = get_commits_since(repo_root, last_sync)
+            except Exception as e:
+                st.error(f"❌ git log feilet: {e}")
+                st.stop()
+
+            if not commits_to_patch:
+                st.success("✅ Ingen nye commits siden sist sync — ingenting å patche.")
+                st.stop()
+
+            st.info(f"**{len(commits_to_patch)} commit(er)** vil bli inkludert i patchen:")
+            for c in commits_to_patch:
+                st.write(f"• `{c['hash']}` {c['message']}")
+        else:
+            st.warning(
+                "⚠️ Ingen sync-historikk funnet. "
+                "**Første patch** vil inkludere alle commits i repoet."
+            )
+            try:
+                all_commits = get_commits_since(repo_root, "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+            except Exception:
+                all_commits = []
+            st.caption(f"Totalt {len(all_commits)} commit(er) i repoet.")
+            commits_to_patch = all_commits
+
+        # ── Generate button ─────────────────────────────────────────────
+        st.divider()
+        description = st.text_input(
+            "📝 Beskrivelse (valgfritt)",
+            placeholder="F.eks. 'Sprint 12 — IMO-normalisering og fleetpanel-fix'",
         )
 
-        changes = None
-        patch_description = ""
-
-        if uploaded_baseline_zip is not None:
-            # ── With ZIP: generate diff-based changes ──
+        if st.button("📤 Generer patch", type="primary", use_container_width=True):
             try:
-                zip_bytes = uploaded_baseline_zip.getvalue()
+                with st.spinner("Kjører git format-patch..."):
+                    patch_text = generate_format_patch(repo_root, last_sync)
 
-                # Show ZIP metadata
-                try:
-                    _, _, zip_metadata = import_patch_from_zip(zip_bytes)
-                    with st.expander("📄 ZIP-metadata", expanded=True):
-                        st.json(zip_metadata)
-                except Exception:
-                    pass
+                meta = {
+                    "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source_side":    "a",
+                    "since_commit":   last_sync or "(første sync)",
+                    "head_commit":    head_hash,
+                    "commit_count":   len(commits_to_patch),
+                    "description":    description,
+                }
+                st.session_state["generated_patch"] = patch_text
+                st.session_state["generated_meta"]  = meta
 
-                # Generate changes from diff
-                with st.spinner("🔍 Sammenligner filer..."):
-                    changes = generate_changes_from_zip_diff(zip_bytes, repo_root)
-
-                if not changes:
-                    st.success("✅ Ingen forskjeller funnet — repoet er identisk med ZIP-en.")
-                else:
-                    st.success(f"✅ Fant {len(changes)} endring(er) basert på diff mot ZIP")
-
-                    # Show changes summary
-                    st.write("**Endringer som vil bli inkludert:**")
-                    for i, c in enumerate(changes):
-                        icon = {
-                            "patch_hunk": "✏️",
-                            "create_file": "🆕",
-                        }.get(c["action"], "❓")
-                        st.write(f"{icon} `{c['action']}` — `{c['file']}`")
-
-            except Exception as e:
-                st.error(f"❌ Kunne ikke prosessere ZIP-fil: {e}")
-
-        else:
-            # ── No ZIP: ask if user wants to send everything ──
-            st.warning(
-                "⚠️ **Ingen baseline-ZIP lastet opp.**\n\n"
-                "Det finnes ingen status fra den andre siden å sammenligne med. "
-                "Er alle endringer i repoet ment å sendes?"
-            )
-
-            if st.button("✅ Ja, send alle filer som patch", use_container_width=True):
-                # Generate a patch with ALL files as create_file
-                all_hashes = compute_file_hashes(repo_root)
-                all_changes = []
-                for rel_path in sorted(all_hashes.keys()):
-                    full_path = repo_root / rel_path
-                    if full_path.exists() and full_path.is_file():
-                        content = full_path.read_text(encoding="utf-8", errors="replace")
-                        all_changes.append({
-                            "file": rel_path,
-                            "action": "create_file",
-                            "content": content,
-                        })
-
-                if all_changes:
-                    changes = all_changes
-                    st.success(f"✅ Klar til å sende {len(changes)} fil(er)")
-                else:
-                    st.error("❌ Ingen filer funnet i repoet")
-
-        # ── Common: description + generate button ──
-        if changes is not None:
-            patch_description = st.text_input(
-                "📝 Beskrivelse (valgfritt)",
-                placeholder="F.eks. 'Oppdatert etter tilbakemelding fra B'",
-                key="diff_description",
-            )
-
-            if st.button(
-                "📤 Generer patch",
-                use_container_width=True,
-                type="primary",
-            ):
-                patch_yaml = generate_patch(
-                    changes=changes,
-                    repo_root=repo_root,
-                    side=current_side,
-                    description=patch_description,
-                )
-                st.session_state["generated_patch"] = patch_yaml
-
-                # Record in history
-                patch = yaml.safe_load(patch_yaml)
-                add_patch_to_history(
+                add_to_history(
                     repo_root,
-                    patch,
                     status="generated",
+                    side="a",
+                    since_hash=last_sync or "",
+                    head_hash=head_hash,
+                    commits=commits_to_patch,
+                    description=description,
                 )
-
-                st.success("✅ Patch generert!")
                 st.rerun()
+            except Exception as e:
+                st.error(f"❌ {e}")
 
-        # Show generated patch if any
+        # ── Transfer options ─────────────────────────────────────────────
         if st.session_state.get("generated_patch"):
+            patch_text = st.session_state["generated_patch"]
+            meta       = st.session_state["generated_meta"]
+
             st.divider()
-            st.subheader("✅ Generert patch")
+            st.subheader("✅ Patch klar — velg overføringsmetode")
 
-            patch_yaml = st.session_state["generated_patch"]
-
-            st.info(
-                "💡 Overfør denne patchen til den andre siden. "
-                "Du kan enten kopiere YAML-en direkte, eller laste ned som ZIP."
+            preview = preview_format_patch(patch_text)
+            st.caption(
+                f"{meta.get('commit_count', '?')} commit(er) · "
+                f"{len(preview['files_changed'])} fil(er) endret"
             )
 
-            with st.expander("📋 Vis YAML", expanded=False):
-                st.code(patch_yaml, language="yaml")
+            tab_copy, tab_zip, tab_file = st.tabs(
+                ["📋 Kopier tekst", "📦 Last ned ZIP", "💾 Last ned .patch-fil"]
+            )
 
-            col_yaml, col_zip = st.columns(2)
-
-            with col_yaml:
-                st.download_button(
-                    label="💾 Last ned som .yaml",
-                    data=patch_yaml,
-                    file_name=f"patch_{current_side}_to_b_{Path(repo_root.name)}.yaml",
-                    mime="text/yaml",
-                    use_container_width=True,
+            with tab_copy:
+                st.caption("Merk alt og kopier. Lim inn i **Lim inn tekst**-fanen på Side B.")
+                st.text_area(
+                    "patch",
+                    value=patch_text,
+                    height=400,
+                    label_visibility="collapsed",
                 )
 
-            with col_zip:
-                zip_bytes = export_patch_to_zip(patch_yaml, repo_root)
+            with tab_zip:
+                st.caption("ZIP med patch og metadata.")
+                zip_bytes = export_patch_to_zip(patch_text, meta)
+                repo_name = repo_root.name
                 st.download_button(
-                    label="📦 Last ned som .zip (anbefalt)",
+                    "📦 Last ned .zip",
                     data=zip_bytes,
-                    file_name=f"patch_{current_side}_to_b_{Path(repo_root.name)}.zip",
+                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
 
+            with tab_file:
+                st.caption("Rå git patch-fil (.patch).")
+                repo_name = repo_root.name
+                st.download_button(
+                    "💾 Last ned .patch",
+                    data=patch_text,
+                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.patch",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+            with st.expander("🔍 Forhåndsvis endringer"):
+                if preview["commits"]:
+                    st.write("**Commits:**")
+                    for c in preview["commits"]:
+                        st.write(f"• `{c['hash']}` {c['subject']}")
+                if preview["files_changed"]:
+                    st.write("**Filer endret:**")
+                    for f in preview["files_changed"]:
+                        st.write(f"• `{f}`")
+                with st.expander("Vis råpatch"):
+                    st.code(patch_text, language="diff")
+
 
 # ═══════════════════════════════════════════════════════════════════════
-# TAB: HISTORY
+# SIDE B — Apply
+# ═══════════════════════════════════════════════════════════════════════
+
+if current_side == "b":
+    with tab_apply:
+        st.subheader("📥 Apply patch fra Side A")
+
+        sync_state = load_sync_state(repo_root)
+        last_sync  = sync_state.get("last_synced_commit")
+        if last_sync:
+            st.caption(f"Sist synket: `{last_sync[:12]}` ({sync_state.get('synced_at', '?')})")
+        else:
+            st.caption("Ikke synket ennå — første patch vil etablere sync-baseline.")
+
+        dirty = get_uncommitted_files(repo_root)
+        if dirty:
+            st.warning(
+                f"⚠️ Repoet har {len(dirty)} ucommittede endringer. "
+                "git am kan feile hvis disse er i konflikt med patchen."
+            )
+
+        st.divider()
+
+        # ── Input method ────────────────────────────────────────────────
+        input_method = st.radio(
+            "Inndatametode",
+            options=["📋 Lim inn tekst", "📦 Last opp ZIP", "💾 Last opp .patch-fil"],
+            horizontal=True,
+        )
+
+        patch_text = ""
+        patch_meta = {}
+
+        if input_method == "📋 Lim inn tekst":
+            patch_text = st.text_area(
+                "patch",
+                height=300,
+                placeholder="Lim inn patch-tekst fra Side A her...",
+                label_visibility="collapsed",
+            )
+
+        elif input_method == "📦 Last opp ZIP":
+            uploaded = st.file_uploader("Last opp .zip", type=["zip"])
+            if uploaded:
+                try:
+                    patch_text, patch_meta = import_patch_from_zip(uploaded.getvalue())
+                    st.success(f"✅ ZIP lastet inn")
+                    with st.expander("📄 Metadata"):
+                        st.json(patch_meta)
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+        elif input_method == "💾 Last opp .patch-fil":
+            uploaded = st.file_uploader("Last opp .patch-fil", type=["patch", "txt"])
+            if uploaded:
+                try:
+                    patch_text = uploaded.getvalue().decode("utf-8")
+                    st.success(f"✅ Patch-fil lastet inn ({len(patch_text)} tegn)")
+                except Exception as e:
+                    st.error(f"❌ Kunne ikke lese fil: {e}")
+
+        # ── Preview + Apply ─────────────────────────────────────────────
+        if patch_text.strip():
+            preview = preview_format_patch(patch_text)
+
+            with st.expander("🔍 Forhåndsvis patch", expanded=True):
+                if preview["commits"]:
+                    st.write("**Commits som vil bli applisert:**")
+                    for c in preview["commits"]:
+                        st.write(f"• `{c['hash']}` {c['subject']}")
+                if preview["files_changed"]:
+                    st.write(f"**{len(preview['files_changed'])} fil(er) endres:**")
+                    for f in preview["files_changed"]:
+                        st.write(f"• `{f}`")
+
+            st.divider()
+
+            if st.button("🚀 Apply patch", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("Kjører git am..."):
+                        output = apply_format_patch(repo_root, patch_text)
+
+                    # Find the new HEAD after apply
+                    new_head = get_current_commit(repo_root)
+                    save_sync_state(repo_root, new_head)
+
+                    add_to_history(
+                        repo_root,
+                        status="applied",
+                        side="b",
+                        since_hash=last_sync or "",
+                        head_hash=new_head,
+                        commits=preview["commits"],
+                        description=patch_meta.get("description", ""),
+                    )
+
+                    st.success("✅ Patch applisert!")
+                    st.caption(f"Ny HEAD: `{new_head[:12]}`")
+                    if output:
+                        st.code(output)
+                    st.balloons()
+
+                except Exception as e:
+                    st.error(f"❌ Apply feilet:\n\n{e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HISTORY (both sides)
 # ═══════════════════════════════════════════════════════════════════════
 
 with tab_history:
     st.subheader("📜 Patch-historikk")
-
     history = get_patch_history_summary(repo_root)
 
     if not history:
-        st.info("Ingen patch-historikk ennå. Generer eller apply en patch for å komme i gang.")
+        st.info("Ingen historikk ennå.")
     else:
-        st.write(f"**{len(history)} patcher registrert** for `{active_repo['name']}`")
-
+        st.caption(f"{len(history)} patch(er) registrert for **{active_repo['name']}**")
         for entry in history:
-            status_icon = {
-                "applied": "✅",
-                "generated": "📤",
-                "failed": "❌",
-            }.get(entry["status"], "❓")
-
+            status_icon = {"applied": "✅", "generated": "📤"}.get(entry["status"], "❓")
             with st.container(border=True):
-                col1, col2 = st.columns([1, 5])
+                col1, col2 = st.columns([1, 8])
                 with col1:
                     st.write(f"### {status_icon}")
                 with col2:
+                    st.write(f"**{entry['patch_id']}** — {entry['timestamp']}")
                     st.write(
-                        f"**{entry['patch_id']}** — {entry['timestamp']}"
-                    )
-                    st.write(
-                        f"Side {entry['source_side'].upper()} → "
+                        f"Side {entry['side'].upper()} · "
                         f"{entry['status']} · "
-                        f"{entry['change_count']} endring(er) · "
-                        f"_{entry['description']}_"
+                        f"{entry['commit_count']} commit(er)"
+                        + (f" · _{entry['description']}_" if entry.get("description") else "")
                     )
-
-                    # Show changes summary
-                    with st.expander("📋 Vis endringer"):
-                        for c in entry["changes_summary"]:
-                            st.write(f"- `{c['action']}` — `{c['file']}`")
+                    with st.expander("Commits"):
+                        for c in entry.get("commits", []):
+                            st.write(f"• `{c['hash']}` {c['message']}")
