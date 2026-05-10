@@ -60,6 +60,15 @@ Switching to `git format-patch` / `git am` means:
    - **Copy text** — paste directly into Side B's text field
    - **Download .patch** — standard git patch file
    - **Download ZIP** — patch file bundled with metadata
+5. Click **Confirm transfer** to save the sync point
+
+### Side A — Enkeltfiler (Single Files)
+
+Select specific files that have changed since last sync and generate a `git format-patch` for only those files. Same workflow as full patch, but smaller scope.
+
+### Side A — Full Load
+
+Select any tracked files and generate a plain-text block with `----============== <filnavn>` separators. No git involved — just raw file content. Useful for initial setup or full reset.
 
 ### Side B — Apply
 
@@ -68,6 +77,20 @@ Switching to `git format-patch` / `git am` means:
 3. Code Mover previews the commits and files that will change
 4. Click **Apply patch** — `git am` applies the commits
 5. The new HEAD commit is recorded as the new sync baseline
+
+### Side B — Full Load
+
+Paste the text block from Side A and click **Write files to disk**. Files are written directly to the repository, overwriting existing files.
+
+---
+
+## Transfer Modes
+
+| Mode | Description | Git required? |
+|------|-------------|---------------|
+| 📤 **Generer patch** | Full `git format-patch` — all commits since last sync | Yes (both sides) |
+| 📁 **Enkeltfiler** | `git format-patch` for selected files only | Yes (both sides) |
+| 📦 **Full load** | Plain-text file dump with `----==============` separators | No (Side B only needs disk) |
 
 ---
 
@@ -96,6 +119,8 @@ Side A uses this to know which commits to include in the next patch. Side B upda
 
 **`.gitignore` respected** — only git-tracked files are shown and transferred. Binary files, build artifacts, and local config are excluded automatically.
 
+**Full Load overwrite warning** — Side B warns before writing files to disk.
+
 ---
 
 ## Requirements
@@ -105,7 +130,7 @@ Both sides must have:
 - **git** (used directly by Code Mover)
 - **Streamlit** and **PyYAML** (see `requirements.txt`)
 
-Side B must be a git repository with at least one commit. `git am` requires a proper git history to apply patches into.
+Side B must be a git repository with at least one commit for patch apply. Full Load mode does not require git on Side B.
 
 ```bash
 pip install -r requirements.txt
