@@ -1,0 +1,19 @@
+# Code Mover
+_code_mover_backups/
+_code_mover_patches/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
