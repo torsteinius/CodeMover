@@ -21,17 +21,24 @@ from core import (
     validate_repo_markers,
     check_is_git_repo,
     compute_file_structure_snapshot,
+    get_tracked_files,
     # Git state
     get_current_commit,
     get_commits_since,
     get_uncommitted_files,
+    get_changed_files_since,
     # Sync state
     load_sync_state,
     save_sync_state,
     # Patch generation / application
     generate_format_patch,
+    generate_format_patch_for_files,
     preview_format_patch,
     apply_format_patch,
+    # File export
+    export_selected_files,
+    export_files_as_text,
+    parse_and_apply_files_text,
     # ZIP
     export_patch_to_zip,
     import_patch_from_zip,
@@ -39,6 +46,10 @@ from core import (
     add_to_history,
     get_patch_history_summary,
 )
+
+
+
+
 from config import (
     load_config,
     set_side,
@@ -233,9 +244,15 @@ if not check_is_git_repo(repo_root):
 # ─── Tabs ───────────────────────────────────────────────────────────────
 
 if current_side == "a":
-    tab_generate, tab_history = st.tabs(["📤 Generer patch", "📜 Historikk"])
+    tab_generate, tab_files, tab_load, tab_history = st.tabs(
+        ["📤 Generer patch", "📁 Enkeltfiler", "📦 Full load", "📜 Historikk"]
+    )
 else:
-    tab_apply, tab_history = st.tabs(["📥 Apply patch", "📜 Historikk"])
+    tab_apply, tab_load, tab_history = st.tabs(
+        ["📥 Apply patch", "📦 Full load", "📜 Historikk"]
+    )
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -344,18 +361,36 @@ if current_side == "a":
                 f"{len(preview['files_changed'])} fil(er) endret"
             )
 
+            # ── Confirm transfer (always visible, no scrolling needed) ──
+            st.divider()
+            st.subheader("✅ Bekreft overføring")
+            st.caption(
+                "Merk av når patchen er overført til Side B. "
+                "Da lagres dette sync-punktet, og neste patch vil kun inneholde nye commits."
+            )
+
+            if st.button("✅ Bekreft at patchen er overført", type="primary", use_container_width=True):
+                save_sync_state(repo_root, head_hash)
+                st.session_state["generated_patch"] = None
+                st.session_state["generated_meta"] = {}
+                st.success(f"✅ Sync-punkt lagret: `{head_hash[:12]}`")
+                st.rerun()
+
+            st.divider()
+
             tab_copy, tab_zip, tab_file = st.tabs(
                 ["📋 Kopier tekst", "📦 Last ned ZIP", "💾 Last ned .patch-fil"]
             )
 
             with tab_copy:
-                st.caption("Merk alt og kopier. Lim inn i **Lim inn tekst**-fanen på Side B.")
-                st.text_area(
-                    "patch",
-                    value=patch_text,
-                    height=400,
-                    label_visibility="collapsed",
+                st.caption("Kopier patchen og lim inn på Side B.")
+                st.markdown(
+                    f'<div style="max-height:500px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">',
+                    unsafe_allow_html=True,
                 )
+                st.code(patch_text, language="diff", line_numbers=False)
+                st.markdown('</div>', unsafe_allow_html=True)
+
 
             with tab_zip:
                 st.caption("ZIP med patch og metadata.")
@@ -393,9 +428,169 @@ if current_side == "a":
                     st.code(patch_text, language="diff")
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# SIDE A — Enkeltfiler (velg enkeltfiler, samme patch-flyt)
+# ═══════════════════════════════════════════════════════════════════════
+
+if current_side == "a":
+    with tab_files:
+        st.subheader("📁 Velg enkeltfiler å overføre")
+        st.caption(
+            "Velg spesifikke filer som er endret siden sist sync. "
+            "Det genereres en **git format-patch** som bare inneholder diff for valgte filer — "
+            "samme flyt som 'Generer patch', men i mindre skala."
+        )
+
+        # ── Hent endrede filer ──────────────────────────────────────────
+        try:
+            head_hash   = get_current_commit(repo_root)
+            sync_state  = load_sync_state(repo_root)
+            last_sync   = sync_state.get("last_synced_commit")
+        except Exception as e:
+            st.error(f"❌ Klarte ikke å lese git-status: {e}")
+            st.stop()
+
+        try:
+            changed_files = get_changed_files_since(repo_root, last_sync or "")
+        except Exception:
+            changed_files = []
+
+        if not changed_files:
+            st.info("💡 Ingen endrede filer siden sist sync.")
+            st.stop()
+
+        st.caption(f"📄 {len(changed_files)} fil(er) endret siden sist sync")
+
+        # ── Velg filer med checkboxer ───────────────────────────────────
+        selected_files = []
+        cols = st.columns(2)
+        for i, file_path in enumerate(changed_files):
+            col = cols[i % 2]
+            with col:
+                if st.checkbox(file_path, key=f"file_{file_path}"):
+                    selected_files.append(file_path)
+
+        # ── Generer patch for valgte filer ──────────────────────────────
+        st.divider()
+        if selected_files:
+            st.success(f"✅ {len(selected_files)} fil(er) valgt")
+
+            description = st.text_input(
+                "📝 Beskrivelse (valgfritt)",
+                key="files_desc",
+                placeholder="F.eks. 'Fikset IMO-oppslag i vessel_tracker.py'",
+            )
+
+            if st.button("📤 Generer patch for valgte filer", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("Kjører git format-patch for valgte filer..."):
+                        patch_text = generate_format_patch_for_files(repo_root, last_sync, selected_files)
+
+
+                    meta = {
+                        "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "source_side":    "a",
+                        "since_commit":   last_sync or "(første sync)",
+                        "head_commit":    head_hash,
+                        "commit_count":   "?",
+                        "description":    description,
+                        "selected_files": selected_files,
+                        "partial":        True,
+                    }
+                    st.session_state["generated_patch"] = patch_text
+                    st.session_state["generated_meta"]  = meta
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+        else:
+            st.info("💡 Velg filer over for å generere patch")
+
+        # ── Vis patch hvis generert ─────────────────────────────────────
+        if st.session_state.get("generated_patch") and st.session_state["generated_meta"].get("partial"):
+            patch_text = st.session_state["generated_patch"]
+            meta       = st.session_state["generated_meta"]
+
+            st.divider()
+            st.subheader("✅ Patch klar — velg overføringsmetode")
+
+            preview = preview_format_patch(patch_text)
+            st.caption(
+                f"{len(meta.get('selected_files', []))} fil(er) · "
+                f"{len(preview['files_changed'])} fil(er) i diff"
+            )
+
+            # ── Confirm transfer ────────────────────────────────────────
+            st.divider()
+            st.subheader("✅ Bekreft overføring")
+            st.caption(
+                "Merk av når patchen er overført til Side B. "
+                "Da lagres dette sync-punktet."
+            )
+
+            if st.button("✅ Bekreft at patchen er overført", key="confirm_files", type="primary", use_container_width=True):
+                save_sync_state(repo_root, head_hash)
+                st.session_state["generated_patch"] = None
+                st.session_state["generated_meta"] = {}
+                st.success(f"✅ Sync-punkt lagret: `{head_hash[:12]}`")
+                st.rerun()
+
+            st.divider()
+
+            tab_copy, tab_zip, tab_file = st.tabs(
+                ["📋 Kopier tekst", "📦 Last ned ZIP", "💾 Last ned .patch-fil"]
+            )
+
+            with tab_copy:
+                st.caption("Kopier patchen og lim inn på Side B.")
+                st.markdown(
+                    f'<div style="max-height:500px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">',
+                    unsafe_allow_html=True,
+                )
+                st.code(patch_text, language="diff", line_numbers=False)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with tab_zip:
+                st.caption("ZIP med patch og metadata.")
+                zip_bytes = export_patch_to_zip(patch_text, meta)
+                repo_name = repo_root.name
+                st.download_button(
+                    "📦 Last ned .zip",
+                    data=zip_bytes,
+                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+            with tab_file:
+                st.caption("Rå git patch-fil (.patch).")
+                repo_name = repo_root.name
+                st.download_button(
+                    "💾 Last ned .patch",
+                    data=patch_text,
+                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.patch",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+            with st.expander("🔍 Forhåndsvis endringer"):
+                if preview["commits"]:
+                    st.write("**Commits:**")
+                    for c in preview["commits"]:
+                        st.write(f"• `{c['hash']}` {c['subject']}")
+                if preview["files_changed"]:
+                    st.write("**Filer endret:**")
+                    for f in preview["files_changed"]:
+                        st.write(f"• `{f}`")
+                with st.expander("Vis råpatch"):
+                    st.code(patch_text, language="diff")
+
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # SIDE B — Apply
 # ═══════════════════════════════════════════════════════════════════════
+
 
 if current_side == "b":
     with tab_apply:
@@ -501,8 +696,136 @@ if current_side == "b":
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SIDE A — Full load (kopier hele filer som tekst)
+# ═══════════════════════════════════════════════════════════════════════
+
+if current_side == "a":
+    with tab_load:
+        st.subheader("📦 Full load — kopier hele filer som tekst")
+        st.caption(
+            "Velg filer og generer en enkel tekstblokk med `----============== <filnavn>`-separator. "
+            "Ingen git, ingen patcher — bare råfilene satt sammen. "
+            "Lim inn på Side B for å overskrive filene."
+        )
+
+        try:
+            all_files = get_tracked_files(repo_root)
+        except Exception as e:
+            st.error(f"❌ Kunne ikke liste filer: {e}")
+            st.stop()
+
+        if not all_files:
+            st.info("Ingen tracked text-filer funnet.")
+            st.stop()
+
+        # ── Filtrering ──────────────────────────────────────────────────
+        filter_text = st.text_input("🔍 Filtrer filer", placeholder="f.eks. .py eller core/")
+        if filter_text:
+            filtered = [f for f in all_files if filter_text.lower() in f.lower()]
+        else:
+            filtered = all_files
+
+        st.caption(f"Viser {len(filtered)} av {len(all_files)} fil(er)")
+
+        # ── Velg filer med checkboxer ───────────────────────────────────
+        selected_files = []
+        cols = st.columns(3)
+        for i, file_path in enumerate(filtered):
+            col = cols[i % 3]
+            with col:
+                if st.checkbox(file_path, key=f"load_file_{file_path}"):
+                    selected_files.append(file_path)
+
+        # ── Generer tekst ───────────────────────────────────────────────
+        st.divider()
+        if selected_files:
+            st.success(f"✅ {len(selected_files)} fil(er) valgt")
+
+            if st.button("📦 Generer full load-tekst", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("Leser filer..."):
+                        full_text = export_files_as_text(repo_root, selected_files)
+                    st.session_state["full_load_text"] = full_text
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+        if st.session_state.get("full_load_text"):
+            full_text = st.session_state["full_load_text"]
+
+            st.divider()
+            st.subheader("✅ Full load-tekst klar")
+            st.caption(f"{len(selected_files)} fil(er) · {len(full_text)} tegn")
+
+            st.markdown(
+                f'<div style="max-height:500px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">',
+                unsafe_allow_html=True,
+            )
+            st.code(full_text, language="text", line_numbers=False)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.button("🗑️ Fjern", use_container_width=True):
+                st.session_state["full_load_text"] = None
+                st.rerun()
+        else:
+            st.info("💡 Velg filer over og trykk 'Generer full load-tekst'")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SIDE B — Full load (lim inn tekst og skriv filer)
+# ═══════════════════════════════════════════════════════════════════════
+
+if current_side == "b":
+    with tab_load:
+        st.subheader("📦 Full load — lim inn filer og overskriv")
+        st.caption(
+            "Lim inn tekstblokken fra Side A. "
+            "Filene skrives til disk og **overskriver** eksisterende filer."
+        )
+
+        full_text = st.text_area(
+            "Lim inn full load-tekst her",
+            height=400,
+            placeholder="----============== core/app.py\n...",
+        )
+
+        if full_text.strip():
+            st.divider()
+            st.warning(
+                "⚠️ Dette vil **overskrive** filer på disk. "
+                "Sørg for at du har backup eller at filene er i git."
+            )
+
+            if st.button("📦 Skriv filer til disk", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("Skriver filer..."):
+                        results = parse_and_apply_files_text(full_text, repo_root)
+
+                    written = [r for r in results if r["status"] == "written"]
+                    errors  = [r for r in results if r["status"] == "error"]
+
+                    if written:
+                        st.success(f"✅ {len(written)} fil(er) skrevet til `{repo_root}`:")
+                        for r in written:
+                            full = repo_root / r['path']
+                            st.write(f"• `{full}`")
+                    if errors:
+                        st.error(f"❌ {len(errors)} feil:")
+                        for r in errors:
+                            full = repo_root / r['path']
+                            st.write(f"• `{full}`: {r.get('error', 'ukjent feil')}")
+
+
+                    if written and not errors:
+                        st.balloons()
+                except Exception as e:
+                    st.error(f"❌ {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # HISTORY (both sides)
 # ═══════════════════════════════════════════════════════════════════════
+
 
 with tab_history:
     st.subheader("📜 Patch-historikk")
@@ -513,19 +836,26 @@ with tab_history:
     else:
         st.caption(f"{len(history)} patch(er) registrert for **{active_repo['name']}**")
         for entry in history:
-            status_icon = {"applied": "✅", "generated": "📤"}.get(entry["status"], "❓")
+            status_icon = {"applied": "✅", "generated": "📤"}.get(entry.get("status", ""), "❓")
             with st.container(border=True):
                 col1, col2 = st.columns([1, 8])
                 with col1:
                     st.write(f"### {status_icon}")
                 with col2:
-                    st.write(f"**{entry['patch_id']}** — {entry['timestamp']}")
+                    st.write(f"**{entry.get('patch_id', '?')}** — {entry.get('timestamp', '?')}")
+                    side = entry.get("side") or entry.get("source_side", "?")
                     st.write(
-                        f"Side {entry['side'].upper()} · "
-                        f"{entry['status']} · "
-                        f"{entry['commit_count']} commit(er)"
-                        + (f" · _{entry['description']}_" if entry.get("description") else "")
+                        f"Side {side.upper()} · "
+                        f"{entry.get('status', '?')} · "
+                        f"{entry.get('commit_count', entry.get('change_count', '?'))} commit(er)"
+                        + (f" · _{entry.get('description', '')}_" if entry.get("description") else "")
                     )
-                    with st.expander("Commits"):
-                        for c in entry.get("commits", []):
-                            st.write(f"• `{c['hash']}` {c['message']}")
+                    commits = entry.get("commits") or entry.get("changes_summary", [])
+                    if commits:
+                        with st.expander("Commits"):
+                            for c in commits:
+                                if "hash" in c:
+                                    st.write(f"• `{c['hash']}` {c.get('message', '')}")
+                                else:
+                                    st.write(f"• {c.get('action', '?')} `{c.get('file', '?')}`")
+

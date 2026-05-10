@@ -190,6 +190,20 @@ def get_uncommitted_files(repo_root: Path) -> list[dict]:
     return files
 
 
+def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
+    """Return list of files changed in commits since since_hash (or all commits if empty)."""
+    base = since_hash if since_hash else _EMPTY_TREE
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{base}..HEAD"],
+        cwd=str(repo_root),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(f for f in result.stdout.splitlines() if f.strip())
+
+
+
 # ─── Sync State ─────────────────────────────────────────────────────────
 
 
@@ -224,6 +238,123 @@ def save_sync_state(repo_root: Path, commit_hash: str) -> None:
 _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
+def get_file_content(repo_root: Path, file_path: str) -> str:
+    """Read a file from the git working tree (HEAD version if committed, else working copy)."""
+    full_path = repo_root / file_path
+    if full_path.exists():
+        return full_path.read_text(encoding="utf-8")
+    # Fallback: try to read from git HEAD
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{file_path}"],
+        cwd=str(repo_root),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Kunne ikke lese {file_path}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def export_selected_files(repo_root: Path, selected_files: list[str]) -> bytes:
+    """Create a ZIP with the raw content of selected files as they are in HEAD.
+
+    Returns ZIP bytes containing:
+      files.json — manifest with file paths and metadata
+      <file>     — each selected file as a separate entry
+    """
+    buf = io.BytesIO()
+    manifest = {
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "files": [],
+    }
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in selected_files:
+            try:
+                content = get_file_content(repo_root, file_path)
+                zf.writestr(file_path, content)
+                manifest["files"].append({
+                    "path": file_path,
+                    "size": len(content),
+                })
+            except Exception as e:
+                manifest["files"].append({
+                    "path": file_path,
+                    "error": str(e),
+                })
+        zf.writestr("_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+    return buf.getvalue()
+
+
+_FILE_SEPARATOR = "\n\n----============== {filnavn}\n\n"
+
+
+def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
+    """Combine selected files into a single text block with file separators.
+
+    Each file is prefixed with:
+        ----============== <filnavn>
+        PATH: <relativ sti fra repo-root>
+
+    This makes it easy to copy-paste between environments without git.
+    """
+    parts = []
+    for file_path in selected_files:
+        try:
+            content = get_file_content(repo_root, file_path)
+            parts.append(
+                f"----============== {file_path}\n"
+                f"PATH: {file_path}\n"
+                f"{content}"
+            )
+        except Exception as e:
+            parts.append(
+                f"----============== {file_path}\n"
+                f"PATH: {file_path}\n"
+                f"# ERROR: {e}"
+            )
+    return "\n\n".join(parts)
+
+
+
+def parse_and_apply_files_text(text: str, target_dir: Path) -> list[dict]:
+    """Parse a text block with ----============== separators and write files to disk.
+
+    Args:
+        text:        The text block from export_files_as_text.
+        target_dir:  Root directory where files will be written.
+
+    Returns:
+        List of dicts with {path, status, error?} for each file.
+    """
+    results = []
+    # Split on the separator pattern
+    blocks = re.split(r"^----==============\s+(.+)$", text, flags=re.MULTILINE)
+    # blocks[0] is preamble (empty or ignored)
+    # blocks[1:] are alternating [filnavn, innhold, filnavn, innhold, ...]
+    i = 1
+    while i < len(blocks) - 1:
+        file_path = blocks[i].strip()
+        content = blocks[i + 1]
+        i += 2
+
+        if not file_path:
+            continue
+
+        # Remove leading/trailing blank lines from content
+        content = content.strip("\n")
+
+        full_path = target_dir / file_path
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content, encoding="utf-8")
+            results.append({"path": file_path, "status": "written"})
+        except Exception as e:
+            results.append({"path": file_path, "status": "error", "error": str(e)})
+
+    return results
+
+
+
+
 def generate_format_patch(repo_root: Path, since_hash: Optional[str] = None) -> str:
     """Generate a git format-patch covering commits since since_hash (or all commits).
 
@@ -248,6 +379,40 @@ def generate_format_patch(repo_root: Path, since_hash: Optional[str] = None) -> 
     if not result.stdout.strip():
         raise RuntimeError("Ingen nye commits å patche siden sist sync.")
     return result.stdout
+
+
+def generate_format_patch_for_files(
+    repo_root: Path, since_hash: Optional[str], selected_files: list[str]
+) -> str:
+    """Generate a git format-patch covering only the selected files.
+
+    Uses 'git format-patch <base>..HEAD --stdout -- <file1> <file2> ...'
+    to produce a patch that only includes diffs for the specified files.
+
+    Args:
+        repo_root:       Repository root.
+        since_hash:      Last synced commit hash. If None, includes all commits.
+        selected_files:  List of file paths (relative to repo root) to include.
+
+    Returns:
+        The full text output of 'git format-patch ... --stdout -- <files>'.
+
+    Raises:
+        RuntimeError on git errors or if there is nothing to patch.
+    """
+    base = since_hash if since_hash else _EMPTY_TREE
+    cmd = ["git", "format-patch", f"{base}..HEAD", "--stdout", "--"] + selected_files
+    result = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git format-patch feilet:\n{result.stderr.strip()}")
+    if not result.stdout.strip():
+        raise RuntimeError("Ingen endringer for valgte filer siden sist sync.")
+    return result.stdout
+
 
 
 # ─── Patch Preview ──────────────────────────────────────────────────────
