@@ -1,12 +1,12 @@
 # Code Mover
 
-Safe patch-based code transfer for isolated/offline environments.
+Git-based code transfer for isolated/offline environments.
 
 ## Purpose
 
-Code Mover is a Streamlit application designed for environments where code cannot be pushed directly through Git, CI/CD, or external services — such as air-gapped government networks, isolated infrastructure, or offline systems.
+Code Mover is a Streamlit application for environments where code cannot be pushed directly through Git, CI/CD, or external services — such as air-gapped government networks, isolated infrastructure, or offline systems.
 
-Instead of transferring entire files, Code Mover transfers precise, validated patches. This reduces transfer size, LLM token usage, risk of accidental overwrites, and manual copy/paste work.
+Instead of reinventing the wheel, Code Mover uses **git as its engine**. Patches are generated with `git format-patch` and applied with `git am`. This means commit history, authorship, and diffs are all handled by git itself — battle-tested, well-understood, and with no custom parsing logic to maintain.
 
 ---
 
@@ -14,108 +14,38 @@ Instead of transferring entire files, Code Mover transfers precise, validated pa
 
 Code Mover uses a **two-sided model**:
 
-- **Side A (Sender)** — has access to an LLM or external tools. Generates a structured YAML patch describing what changed.
-- **Side B (Receiver)** — the isolated environment. Receives the patch, validates it, previews changes, and applies it.
+- **Side A (Sender)** — has git access and optionally an LLM. Generates a patch from all commits since the last sync.
+- **Side B (Receiver)** — the isolated environment. Receives the patch and applies it with `git am`, preserving the full commit history.
 
 ```
-LLM (external)
+Side A (connected)
     ↓
-Generate structured YAML patch
+git format-patch <last_sync>..HEAD
     ↓
-Transfer manually (copy/paste or ZIP file)
+Transfer manually (copy/paste, .patch file, or ZIP)
     ↓
-Code Mover on Side B
+Side B (isolated)
     ↓
-Validate → Preview → Backup → Apply
+git am → commits applied with full history intact
+    ↓
+Sync state updated (new HEAD recorded)
 ```
+
+Sync state — the commit hash that was last successfully transferred — is stored in `_code_mover_patches/sync.json` in each repository. This is how Code Mover knows which commits are new and need to be included in the next patch.
 
 ---
 
-## Core Principles
+## Why Git as the Engine
 
-**1. Transfer intent, not files**
-Send only the exact changes, not entire file contents.
+Earlier versions of Code Mover used a custom YAML patch format. This required building and maintaining parsers, validators, diff generators, and apply logic from scratch — all of which git already does correctly and robustly.
 
-**2. Validate everything before writing**
-Every patch must pass YAML validation, path validation, repository validation, and exact block-match validation before any file is touched.
+Switching to `git format-patch` / `git am` means:
 
-**3. Fail closed**
-If anything is uncertain — missing file, multiple block matches, invalid path, malformed YAML — patching stops immediately. No partial patching is allowed.
-
----
-
-## Supported Actions
-
-### `patch_hunk`
-Replace a block of code using unified diff notation. Lines starting with `-` are removed, lines starting with `+` are added, and lines starting with a space are context (used to tighten the match). The `-` block must match exactly once in the target file.
-
-```yaml
-- file: "panels/fleet_panel.py"
-  action: "patch_hunk"
-  hunk: |
-    @@ -15,1 +15,1 @@
-    -imo = st.text_input("IMO")
-    +imo = normalize_imo(st.text_input("IMO"))
-```
-
-With context lines for more precise matching:
-
-```yaml
-- file: "panels/fleet_panel.py"
-  action: "patch_hunk"
-  hunk: |
-    @@ -14,3 +14,3 @@
-     def render_fleet():
-    -    imo = st.text_input("IMO")
-    +    imo = normalize_imo(st.text_input("IMO"))
-         st.write(imo)
-```
-
-### `create_file`
-Create a new file. Refuses to overwrite existing files. Creates missing parent directories automatically.
-
-```yaml
-- file: "core/utils/example.py"
-  action: "create_file"
-  content: |
-    def hello():
-        print("hello")
-```
-
-### `append_to_file`
-Append content to the end of an existing file.
-
-```yaml
-- file: "requirements.txt"
-  action: "append_to_file"
-  content: |
-    pyyaml
-```
-
----
-
-## Patch Format
-
-A patch is a YAML document with a version, description, and a list of changes:
-
-```yaml
-version: 1
-description: "Add IMO normalization"
-
-changes:
-  - file: "core/fleet/imo_lookup.py"
-    action: "create_file"
-    content: |
-      def normalize_imo(value: str) -> str:
-          return str(value).replace("IMO", "").strip()
-
-  - file: "panels/fleet_panel.py"
-    action: "patch_hunk"
-    hunk: |
-      @@ -15,1 +15,1 @@
-      -imo = st.text_input("IMO")
-      +imo = normalize_imo(st.text_input("IMO"))
-```
+- **No custom patch format** — the transfer format is standard git, readable by any git tooling
+- **Commit history preserved** — Side B gets the actual commits, not just file changes
+- **Battle-tested apply logic** — `git am` handles conflicts, encoding, line endings, and binary files
+- **`.gitignore` respected** — only tracked files are included, automatically
+- **Less code to maintain** — the core is thin wrapper around git, not a reimplementation of it
 
 ---
 
@@ -123,84 +53,81 @@ changes:
 
 ### Side A — Generate
 
-1. Select active repository
-2. Optionally upload a baseline ZIP from a previous transfer to generate a diff-based patch
-3. If no baseline ZIP, optionally send all files
-4. Add a description and click **Generate patch**
-5. Download the patch as `.yaml` or `.zip` (recommended — includes file hashes for tamper detection)
+1. Select the active repository in the sidebar
+2. Code Mover shows all commits since the last sync, and warns if there are uncommitted changes
+3. Add an optional description and click **Generate patch**
+4. Transfer the patch to Side B using one of three methods:
+   - **Copy text** — paste directly into Side B's text field
+   - **Download .patch** — standard git patch file
+   - **Download ZIP** — patch file bundled with metadata
 
 ### Side B — Apply
 
-1. Select active repository
-2. Paste YAML or upload ZIP
-3. Click **Validate patch** — shows a unified diff preview
-4. Click **Apply patch** — backups are created, changes are written
+1. Select the active repository
+2. Choose input method: paste text, upload ZIP, or upload .patch file
+3. Code Mover previews the commits and files that will change
+4. Click **Apply patch** — `git am` applies the commits
+5. The new HEAD commit is recorded as the new sync baseline
 
 ---
 
-## Safety Features
+## Sync State
 
-**Path validation** — rejects `../`, absolute paths, and paths outside the repository root.
+The sync state is a single commit hash stored in `_code_mover_patches/sync.json`:
 
-**Exact match validation** — for `patch_hunk`, the `-` lines must match exactly one time in the target file. This prevents patch drift and accidental replacements.
+```json
+{
+  "last_synced_commit": "34d312ea6a3a...",
+  "synced_at": "2026-05-10 19:30:00"
+}
+```
 
-**Atomic apply** — the entire patch is validated before any file is written. If change #8 fails, changes #1–7 are not applied.
-
-**Automatic backups** — before applying, all affected files are backed up to `_code_mover_backups/YYYYMMDD_HHMMSS/`.
-
-**Tree fingerprinting** — a hash of the repository structure is embedded in generated patches, so Side B can verify it received a patch intended for the correct repo state.
-
-**Tamper detection** — file hashes are embedded in ZIP exports. Side B detects any files that changed unexpectedly since the last patch.
-
----
-
-## Repository Orientation
-
-Code Mover identifies the repository root by walking upward from the current directory until it finds a folder containing all configured markers (default: `app.py`, `core.py`). Custom markers can be set per repo in the sidebar.
-
-If the repository root cannot be found, patching stops immediately.
+Side A uses this to know which commits to include in the next patch. Side B updates it after a successful `git am`. This replaces the older ZIP-baseline approach, which required shipping full file snapshots.
 
 ---
 
-## Multi-Repo Support
+## Safety
 
-Multiple repositories can be registered in the sidebar. Each repo has a name, absolute path, and optional set of markers. The active repo can be switched at any time.
+**Uncommitted changes warning** — Side A warns if there are uncommitted changes in the repo. These are not included in the patch; they must be committed first.
 
-Use the **Discover repos** button to automatically scan common locations.
+**`git am --3way`** — if a patch doesn't apply cleanly, git falls back to a three-way merge rather than failing outright.
 
----
+**Abort on failure** — if `git am` fails, Code Mover runs `git am --abort` automatically to leave the repo in a clean state.
 
-## Patch History
-
-All generated and applied patches are recorded in `_code_mover_patches/`. The history tab shows:
-
-- Timestamp and patch ID
-- Source side and status (generated / applied / failed)
-- Number of changes and description
-- Per-file action summary
+**`.gitignore` respected** — only git-tracked files are shown and transferred. Binary files, build artifacts, and local config are excluded automatically.
 
 ---
 
-## Why YAML Instead of Git Diff
+## Requirements
 
-Traditional git patches are compact but fragile for LLM generation. Structured YAML is easier for LLMs to produce correctly, easier to validate programmatically, and more deterministic — especially in isolated environments where tooling may be limited.
+Both sides must have:
+- **Python 3.10+**
+- **git** (used directly by Code Mover)
+- **Streamlit** and **PyYAML** (see `requirements.txt`)
 
----
-
-## Installation
+Side B must be a git repository with at least one commit. `git am` requires a proper git history to apply patches into.
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-**Requirements:** Python 3.10+, `streamlit>=1.28.0`, `pyyaml>=6.0`
+---
+
+## Multi-Repo Support
+
+Multiple repositories can be registered in the sidebar. Each repo has a name, absolute path, and optional set of markers used to identify the repo root. Use **Discover repos** to scan common locations automatically.
+
+---
+
+## Patch History
+
+All generated and applied patches are recorded in `_code_mover_patches/history.json`. The history tab shows timestamp, side, status, and the list of commits included in each patch.
 
 ---
 
 ## Suggested Future Features
 
-- **Optional test execution** — run `pytest` automatically after applying a patch
-- **Patch signing** — digitally sign patches to verify origin
-- **Patch history database** — store timestamp, user, patch hash, changed files, and status
-- **Rollback UI** — restore a previous backup snapshot directly from the Streamlit interface
+- **Patch signing** — verify that a patch came from a trusted source before applying
+- **Conflict resolution UI** — surface `git am` conflicts in the Streamlit interface instead of requiring manual resolution
+- **Multi-repo batch transfer** — generate and bundle patches for several repos at once
