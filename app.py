@@ -72,10 +72,8 @@ if "generated_patch" not in st.session_state:
     st.session_state["generated_patch"] = None      # raw patch text
 if "generated_meta" not in st.session_state:
     st.session_state["generated_meta"] = {}         # metadata dict
-if "repo_form_name" not in st.session_state:
-    st.session_state["repo_form_name"] = ""
-if "repo_form_path" not in st.session_state:
-    st.session_state["repo_form_path"] = ""
+if "discovered_repos" not in st.session_state:
+    st.session_state["discovered_repos"] = []
 
 
 # ─── Sidebar ────────────────────────────────────────────────────────────
@@ -175,49 +173,59 @@ with st.sidebar:
 
     # ── Repo management ──
     with st.expander("➕ Legg til / fjern repo"):
+
+        # Search button — results stored in session state so they survive reruns
         if st.button("🔍 Søk etter repoer", use_container_width=True):
             with st.spinner("Søker..."):
                 found = discover_repos()
-            if found:
-                st.success(f"Fant {len(found)} repo(er)")
-                for r in found:
-                    col_a, col_b, col_c = st.columns([2, 3, 1])
-                    with col_a:
-                        st.write(f"{'📁' if r.get('has_git') else '📂'} **{r['name']}**")
-                    with col_b:
-                        st.caption(f"`{r['path']}`")
-                    with col_c:
-                        if st.button("✅", key=f"add_{r['name']}"):
-                            add_repo(r["name"], r["path"])
-                            set_active_repo(r["name"])
-                            st.rerun()
-            else:
-                st.warning("Ingen repoer funnet. Legg til manuelt.")
+            # Filter out already-registered repos
+            existing_paths = {r["path"] for r in config.get("repos", [])}
+            st.session_state["discovered_repos"] = [
+                r for r in found if r["path"] not in existing_paths
+            ]
+            if not st.session_state["discovered_repos"]:
+                st.info("Ingen nye repoer funnet.")
 
+        # Show discovered repos persistently until all are added/dismissed
+        discovered = st.session_state.get("discovered_repos", [])
+        if discovered:
+            st.caption(f"{len(discovered)} repo(er) funnet — klikk for å legge til:")
+            for r in list(discovered):
+                col_name, col_path, col_btn = st.columns([2, 4, 1])
+                with col_name:
+                    icon = "📁" if r.get("has_git") else "📂"
+                    st.write(f"{icon} **{r['name']}**")
+                with col_path:
+                    st.caption(f"`{r['path']}`")
+                with col_btn:
+                    if st.button("＋", key=f"add_{r['path']}"):
+                        add_repo(r["name"], r["path"])
+                        set_active_repo(r["name"])
+                        # Remove from discovered list
+                        st.session_state["discovered_repos"] = [
+                            x for x in st.session_state["discovered_repos"]
+                            if x["path"] != r["path"]
+                        ]
+                        st.rerun()
+
+        # Manual fallback: just a path — name is derived from folder name
         st.divider()
+        st.caption("Legg til manuelt:")
+        manual_path = st.text_input(
+            "Sti til repo",
+            placeholder="/Users/bruker/Documents/GitHub/mitt-repo",
+            label_visibility="collapsed",
+        )
+        if st.button("➕ Legg til", use_container_width=True, disabled=not manual_path.strip()):
+            p = Path(manual_path.strip())
+            if p.is_dir():
+                add_repo(p.name, str(p))
+                set_active_repo(p.name)
+                st.rerun()
+            else:
+                st.error("Finner ikke mappen.")
 
-        with st.form("add_repo_form"):
-            new_name = st.text_input(
-                "Repo-navn",
-                value=st.session_state.get("repo_form_name", ""),
-                placeholder="fleet-manager",
-            )
-            new_path = st.text_input(
-                "Sti (absolutt)",
-                value=st.session_state.get("repo_form_path", ""),
-                placeholder="/Users/bruker/Documents/GitHub/fleet-manager",
-            )
-            new_markers = st.text_input("Markører (kommaseparert)", value="app.py, core.py")
-            if st.form_submit_button("💾 Lagre repo", use_container_width=True):
-                if new_name and new_path:
-                    markers = [m.strip() for m in new_markers.split(",") if m.strip()]
-                    add_repo(new_name, new_path, markers)
-                    st.session_state["repo_form_name"] = ""
-                    st.session_state["repo_form_path"] = ""
-                    st.rerun()
-                else:
-                    st.error("Fyll inn navn og sti")
-
+        # Remove repo
         if repo_names:
             st.divider()
             to_remove = st.selectbox("Fjern repo", options=[""] + repo_names, key="remove_selector")
