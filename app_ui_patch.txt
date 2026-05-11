@@ -1,0 +1,117 @@
+----====== PATCH: app.py
+@@
+FIND:
+            is_full_load = (
+                "----==============" in patch_text
+                and not patch_text.strip().startswith("From ")
+            )
+
+REPLACE:
+            is_full_load = (
+                "----==============" in patch_text
+                and not patch_text.strip().startswith("From ")
+            )
+
+            is_llm_patch = (
+                re.search(
+                    r"^----======\s+"
+                    r"(FILE|OVERWRITE|DELETE|PATCH|INSERT_AFTER|INSERT_BEFORE|DELETE_BLOCK)"
+                    r":\s+.+$",
+                    patch_text,
+                    flags=re.MULTILINE,
+                )
+                is not None
+                and not patch_text.strip().startswith("From ")
+            )
+
+----====== PATCH: app.py
+@@
+FIND:
+            # ── FULL LOAD FORMAT ─────────────────────────────────────────
+            if is_full_load:
+                st.info(
+
+REPLACE:
+            # ── LLM PATCH FORMAT ─────────────────────────────────────────
+            if is_llm_patch:
+                st.info(
+                    "🤖 **LLM Patch-format detektert** — dette er ikke en git patch. "
+                    "Patchen vil bli applisert med Code Movers interne LLM-patchmotor, "
+                    "ikke med `git am`."
+                )
+
+                st.warning(
+                    "⚠️ LLM Patch gjør direkte filendringer på disk. "
+                    "Sørg for at repoet er i git, slik at du kan se diff og rulle tilbake."
+                )
+
+                if st.button(
+                    "🤖 Apply LLM patch",
+                    type="primary",
+                    use_container_width=True,
+                    key="apply_tab_llm_patch",
+                ):
+                    try:
+                        with st.spinner("Appliserer LLM patch..."):
+                            results = parse_llm_patch(patch_text, repo_root)
+
+                        created = [r for r in results if r["status"] == "created"]
+                        overwritten = [r for r in results if r["status"] == "overwritten"]
+                        patched = [r for r in results if r["status"] == "patched"]
+                        inserted_after = [r for r in results if r["status"] == "inserted_after"]
+                        inserted_before = [r for r in results if r["status"] == "inserted_before"]
+                        deleted_block = [r for r in results if r["status"] == "deleted_block"]
+                        deleted = [r for r in results if r["status"] == "deleted"]
+                        written = [r for r in results if r["status"] == "written"]
+                        errors = [r for r in results if r["status"] == "error"]
+
+                        changed_count = (
+                            len(created)
+                            + len(overwritten)
+                            + len(patched)
+                            + len(inserted_after)
+                            + len(inserted_before)
+                            + len(deleted_block)
+                            + len(deleted)
+                            + len(written)
+                        )
+
+                        if changed_count:
+                            st.success(
+                                f"✅ {changed_count} operasjon(er) utført i "
+                                f"`{repo_root.name}`"
+                            )
+
+                        if created:
+                            st.write(f"🆕 {len(created)} fil(er) opprettet")
+                        if overwritten:
+                            st.write(f"♻️ {len(overwritten)} fil(er) overskrevet")
+                        if patched:
+                            st.write(f"🔧 {len(patched)} blokk(er) erstattet")
+                        if inserted_after:
+                            st.write(f"➕ {len(inserted_after)} insert-after utført")
+                        if inserted_before:
+                            st.write(f"➕ {len(inserted_before)} insert-before utført")
+                        if deleted_block:
+                            st.write(f"✂️ {len(deleted_block)} blokk(er) slettet")
+                        if deleted:
+                            st.write(f"🗑️ {len(deleted)} fil(er) slettet")
+                        if written:
+                            st.write(f"📝 {len(written)} fil(er) skrevet")
+
+                        if errors:
+                            st.error(f"❌ {len(errors)} feil:")
+                            for r in errors:
+                                st.write(
+                                    f"• `{r['path']}`: {r.get('error', 'ukjent feil')}"
+                                )
+
+                        if changed_count and not errors:
+                            st.balloons()
+
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+
+            # ── FULL LOAD FORMAT ─────────────────────────────────────────
+            elif is_full_load:
+                st.info(
