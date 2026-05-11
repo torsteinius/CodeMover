@@ -49,6 +49,19 @@ SKIP_DIRS = {
     "node_modules", ".venv", "venv", "env",
 }
 
+# Extensions that are NEVER transferred — regardless of git tracking
+NEVER_TRANSFER_EXTENSIONS = {
+    ".pyc", ".pyo", ".pyd",
+    ".so", ".dll", ".dylib", ".a", ".lib",
+    ".exe", ".bin",
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp", ".svg",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+    ".pdf", ".docx", ".xlsx", ".pptx",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv",
+    ".db", ".sqlite", ".sqlite3",
+    ".ttf", ".otf", ".woff", ".woff2",
+}
+
 
 # ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -191,7 +204,10 @@ def get_uncommitted_files(repo_root: Path) -> list[dict]:
 
 
 def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
-    """Return list of files changed in commits since since_hash (or all commits if empty)."""
+    """Return list of transferable files changed in commits since since_hash.
+
+    Filters out binary files, .pyc, and anything in NEVER_TRANSFER_EXTENSIONS.
+    """
     base = since_hash if since_hash else _EMPTY_TREE
     result = subprocess.run(
         ["git", "diff", "--name-only", f"{base}..HEAD"],
@@ -200,7 +216,11 @@ def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
     )
     if result.returncode != 0:
         return []
-    return sorted(f for f in result.stdout.splitlines() if f.strip())
+    return sorted(
+        f for f in result.stdout.splitlines()
+        if f.strip()
+        and Path(f).suffix.lower() not in NEVER_TRANSFER_EXTENSIONS
+    )
 
 
 

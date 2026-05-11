@@ -438,25 +438,31 @@ if current_side == "a":
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# SIDE A — Enkeltfiler (velg enkeltfiler, samme patch-flyt)
+# SIDE A — Enkeltfiler
 # ═══════════════════════════════════════════════════════════════════════
+
+def _ef_key(f: str) -> str:
+    return f"ef_cb_{f}"
+
+def _folder_select(files: list, value: bool) -> None:
+    for f in files:
+        st.session_state[_ef_key(f)] = value
 
 if current_side == "a":
     with tab_files:
         st.subheader("📁 Velg enkeltfiler å overføre")
         st.caption(
-            "Velg spesifikke filer som er endret siden sist sync. "
-            "Det genereres en **git format-patch** som bare inneholder diff for valgte filer — "
-            "samme flyt som 'Generer patch', men i mindre skala."
+            "Velg spesifikke filer endret siden sist sync. "
+            "Genererer en **git format-patch** kun for valgte filer."
         )
 
-        # ── Hent endrede filer ──────────────────────────────────────────
+        # ── Hent git-status ─────────────────────────────────────────────
         try:
-            head_hash   = get_current_commit(repo_root)
-            sync_state  = load_sync_state(repo_root)
-            last_sync   = sync_state.get("last_synced_commit")
+            head_hash  = get_current_commit(repo_root)
+            sync_state = load_sync_state(repo_root)
+            last_sync  = sync_state.get("last_synced_commit")
         except Exception as e:
-            st.error(f"❌ Klarte ikke å lese git-status: {e}")
+            st.error(f"❌ {e}")
             st.stop()
 
         try:
@@ -465,44 +471,108 @@ if current_side == "a":
             changed_files = []
 
         if not changed_files:
-            st.info("💡 Ingen endrede filer siden sist sync.")
+            st.info("Ingen endrede filer siden sist sync.")
             st.stop()
 
-        st.caption(f"📄 {len(changed_files)} fil(er) endret siden sist sync")
+        # ── Bygg mappestruktur ───────────────────────────────────────────
+        from pathlib import PurePosixPath
+        from collections import defaultdict
 
-        # ── Velg filer med checkboxer ───────────────────────────────────
-        selected_files = []
-        cols = st.columns(2)
-        for i, file_path in enumerate(changed_files):
-            col = cols[i % 2]
-            with col:
-                if st.checkbox(file_path, key=f"file_{file_path}"):
-                    selected_files.append(file_path)
+        folders: dict[str, list[str]] = defaultdict(list)
+        for f in changed_files:
+            parent = str(PurePosixPath(f).parent)
+            folder_key = "" if parent == "." else parent
+            folders[folder_key].append(f)
 
-        # ── Generer patch for valgte filer ──────────────────────────────
+        # Sorter: rot-nivå filer øverst, deretter mapper alfabetisk
+        sorted_folders = sorted(folders.keys(), key=lambda k: ("" if k == "" else k))
+
+        # ── Trevisning med checkboxer ────────────────────────────────────
+        for folder in sorted_folders:
+            files_in_folder = sorted(folders[folder])
+
+            if folder:
+                # Mappeheader med velg/fjern-alle knapper
+                col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
+                with col_icon:
+                    st.write("📁")
+                with col_name:
+                    st.write(f"**{folder}/**")
+                with col_all:
+                    st.button(
+                        "Velg alle",
+                        key=f"ef_all_{folder}",
+                        on_click=_folder_select,
+                        args=(files_in_folder, True),
+                        use_container_width=True,
+                    )
+                with col_none:
+                    st.button(
+                        "Ingen",
+                        key=f"ef_none_{folder}",
+                        on_click=_folder_select,
+                        args=(files_in_folder, False),
+                        use_container_width=True,
+                    )
+            else:
+                # Rot-nivå: bare en liten header
+                col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
+                with col_icon:
+                    st.write("📄")
+                with col_name:
+                    st.write("**(rot)**")
+                with col_all:
+                    st.button(
+                        "Velg alle",
+                        key="ef_all_root",
+                        on_click=_folder_select,
+                        args=(files_in_folder, True),
+                        use_container_width=True,
+                    )
+                with col_none:
+                    st.button(
+                        "Ingen",
+                        key="ef_none_root",
+                        on_click=_folder_select,
+                        args=(files_in_folder, False),
+                        use_container_width=True,
+                    )
+
+            # Filer under denne mappen
+            for f in files_in_folder:
+                col_indent, col_cb = st.columns([1, 11])
+                with col_indent:
+                    st.write("")   # innrykk
+                with col_cb:
+                    st.checkbox(
+                        PurePosixPath(f).name,
+                        key=_ef_key(f),
+                    )
+
+        # ── Saml valgte filer fra session state ──────────────────────────
+        selected_files = [f for f in changed_files if st.session_state.get(_ef_key(f), False)]
+
         st.divider()
-        if selected_files:
-            st.success(f"✅ {len(selected_files)} fil(er) valgt")
+        st.caption(f"**{len(selected_files)}** av {len(changed_files)} fil(er) valgt")
 
+        if selected_files:
             description = st.text_input(
                 "📝 Beskrivelse (valgfritt)",
                 key="files_desc",
                 placeholder="F.eks. 'Fikset IMO-oppslag i vessel_tracker.py'",
             )
 
-            if st.button("📤 Generer patch for valgte filer", type="primary", use_container_width=True):
+            if st.button("📤 Generer patch", type="primary", use_container_width=True, key="ef_generate"):
                 try:
-                    with st.spinner("Kjører git format-patch for valgte filer..."):
-                        patch_text = generate_format_patch_for_files(repo_root, last_sync, selected_files)
-
-
+                    with st.spinner("Kjører git format-patch..."):
+                        patch_text = generate_format_patch_for_files(
+                            repo_root, last_sync, selected_files
+                        )
                     meta = {
                         "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "source_side":    "a",
                         "since_commit":   last_sync or "(første sync)",
                         "head_commit":    head_hash,
-                        "commit_count":   "?",
-                        "description":    description,
                         "selected_files": selected_files,
                         "partial":        True,
                     }
@@ -511,87 +581,36 @@ if current_side == "a":
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ {e}")
-        else:
-            st.info("💡 Velg filer over for å generere patch")
 
-        # ── Vis patch hvis generert ─────────────────────────────────────
+        # ── Vis generert patch ───────────────────────────────────────────
         if st.session_state.get("generated_patch") and st.session_state["generated_meta"].get("partial"):
             patch_text = st.session_state["generated_patch"]
             meta       = st.session_state["generated_meta"]
 
             st.divider()
-            st.subheader("✅ Patch klar — velg overføringsmetode")
-
-            preview = preview_format_patch(patch_text)
-            st.caption(
-                f"{len(meta.get('selected_files', []))} fil(er) · "
-                f"{len(preview['files_changed'])} fil(er) i diff"
-            )
-
-            # ── Confirm transfer ────────────────────────────────────────
-            st.divider()
-            st.subheader("✅ Bekreft overføring")
-            st.caption(
-                "Merk av når patchen er overført til Side B. "
-                "Da lagres dette sync-punktet."
-            )
-
-            if st.button("✅ Bekreft at patchen er overført", key="confirm_files", type="primary", use_container_width=True):
-                save_sync_state(repo_root, head_hash)
-                st.session_state["generated_patch"] = None
-                st.session_state["generated_meta"] = {}
-                st.success(f"✅ Sync-punkt lagret: `{head_hash[:12]}`")
-                st.rerun()
-
-            st.divider()
+            st.subheader("✅ Patch klar")
 
             tab_copy, tab_zip, tab_file = st.tabs(
                 ["📋 Kopier tekst", "📦 Last ned ZIP", "💾 Last ned .patch-fil"]
             )
-
             with tab_copy:
-                st.caption("Kopier patchen og lim inn på Side B.")
-                st.markdown(
-                    f'<div style="max-height:500px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">',
-                    unsafe_allow_html=True,
-                )
-                st.code(patch_text, language="diff", line_numbers=False)
-                st.markdown('</div>', unsafe_allow_html=True)
-
+                st.text_area("patch", value=patch_text, height=400, label_visibility="collapsed")
             with tab_zip:
-                st.caption("ZIP med patch og metadata.")
-                zip_bytes = export_patch_to_zip(patch_text, meta)
-                repo_name = repo_root.name
                 st.download_button(
                     "📦 Last ned .zip",
-                    data=zip_bytes,
-                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.zip",
+                    data=export_patch_to_zip(patch_text, meta),
+                    file_name=f"patch_{repo_root.name}_{head_hash[:8]}_partial.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
-
             with tab_file:
-                st.caption("Rå git patch-fil (.patch).")
-                repo_name = repo_root.name
                 st.download_button(
                     "💾 Last ned .patch",
                     data=patch_text,
-                    file_name=f"patch_{repo_name}_{meta.get('head_commit','')[:8]}.patch",
+                    file_name=f"patch_{repo_root.name}_{head_hash[:8]}_partial.patch",
                     mime="text/plain",
                     use_container_width=True,
                 )
-
-            with st.expander("🔍 Forhåndsvis endringer"):
-                if preview["commits"]:
-                    st.write("**Commits:**")
-                    for c in preview["commits"]:
-                        st.write(f"• `{c['hash']}` {c['subject']}")
-                if preview["files_changed"]:
-                    st.write("**Filer endret:**")
-                    for f in preview["files_changed"]:
-                        st.write(f"• `{f}`")
-                with st.expander("Vis råpatch"):
-                    st.code(patch_text, language="diff")
 
 
 
