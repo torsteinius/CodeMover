@@ -72,12 +72,38 @@ def is_text_file(path: Path) -> bool:
     return path.suffix.lower() in TEXT_EXTENSIONS
 
 
-def get_tracked_files(repo_root: Path) -> list[str]:
-    """Return sorted list of tracked text-file paths relative to repo_root.
+def _is_excluded_path(rel_str: str, parts: tuple) -> bool:
+    """True if this path should always be excluded from transfers."""
+    if "_code_mover_backups" in rel_str or "_code_mover_patches" in rel_str:
+        return True
+    # Skip hidden dirs/files and known junk dirs
+    if any(p.startswith(".") for p in parts):
+        return True
+    if any(p in SKIP_DIRS for p in parts):
+        return True
+    return False
 
-    Uses 'git ls-files' when available (respects .gitignore).
-    Falls back to a manual walk filtered by extension.
+
+def get_tracked_files(repo_root: Path) -> list[str]:
+    """Return sorted list of transferable file paths relative to repo_root.
+
+    Two-pass strategy so no transferable file is ever missed:
+
+    Pass 1 — git ls-files
+        Authoritative for all committed/staged files.  Respects .gitignore so
+        build artefacts that are already excluded stay excluded.
+
+    Pass 2 — recursive OS walk
+        Always runs after Pass 1.  Ensures .py and .sql files are included
+        even when they are brand-new and not yet tracked by git.  Any file
+        whose extension is in TEXT_EXTENSIONS is also picked up here.
+
+    Both passes hard-filter NEVER_TRANSFER_EXTENSIONS (including .pyc/.pyo)
+    and SKIP_DIRS (including __pycache__).
     """
+    seen: set[str] = set()
+
+    # ── Pass 1: git ls-files ─────────────────────────────────────────────
     try:
         result = subprocess.run(
             ["git", "ls-files"],
@@ -85,29 +111,37 @@ def get_tracked_files(repo_root: Path) -> list[str]:
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0:
-            files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-            return sorted(
-                f for f in files
-                if is_text_file(repo_root / f)
-                and "_code_mover_backups" not in f
-                and "_code_mover_patches" not in f
-            )
+            for f in result.stdout.splitlines():
+                f = f.strip()
+                if not f:
+                    continue
+                p = Path(f)
+                if p.suffix.lower() in NEVER_TRANSFER_EXTENSIONS:
+                    continue
+                if _is_excluded_path(f, p.parts):
+                    continue
+                if is_text_file(repo_root / f):
+                    seen.add(f)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
 
-    tracked: list[str] = []
+    # ── Pass 2: OS walk — always runs ────────────────────────────────────
+    # Picks up untracked .py/.sql (and all other TEXT_EXTENSIONS) files.
     for path in sorted(repo_root.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(repo_root)
-        parts = rel.parts
-        if any(p.startswith(".") for p in parts):
+        rel_str = rel.as_posix()
+        suffix = path.suffix.lower()
+
+        if suffix in NEVER_TRANSFER_EXTENSIONS:
             continue
-        if any(p in SKIP_DIRS for p in parts):
+        if _is_excluded_path(rel_str, rel.parts):
             continue
         if is_text_file(path):
-            tracked.append(rel.as_posix())
-    return tracked
+            seen.add(rel_str)
+
+    return sorted(seen)
 
 
 def compute_file_structure_snapshot(repo_root: Path) -> str:
@@ -206,7 +240,10 @@ def get_uncommitted_files(repo_root: Path) -> list[dict]:
 def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
     """Return list of transferable files changed in commits since since_hash.
 
-    Filters out binary files, .pyc, and anything in NEVER_TRANSFER_EXTENSIONS.
+    Hard-filters:
+    - NEVER_TRANSFER_EXTENSIONS (.pyc / .pyo / binaries / media / archives)
+    - __pycache__ and other SKIP_DIRS directories
+    - hidden path components
     """
     base = since_hash if since_hash else _EMPTY_TREE
     result = subprocess.run(
@@ -216,11 +253,19 @@ def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
     )
     if result.returncode != 0:
         return []
-    return sorted(
-        f for f in result.stdout.splitlines()
-        if f.strip()
-        and Path(f).suffix.lower() not in NEVER_TRANSFER_EXTENSIONS
-    )
+
+    out = []
+    for f in result.stdout.splitlines():
+        f = f.strip()
+        if not f:
+            continue
+        p = Path(f)
+        if p.suffix.lower() in NEVER_TRANSFER_EXTENSIONS:
+            continue
+        if _is_excluded_path(f, p.parts):
+            continue
+        out.append(f)
+    return sorted(out)
 
 
 
