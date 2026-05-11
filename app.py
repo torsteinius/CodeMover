@@ -70,6 +70,15 @@ st.title("📦 Code Mover")
 st.caption("Git-based code transfer for isolated environments")
 
 
+# ─── Cached file listing ─────────────────────────────────────────────────────
+# get_tracked_files() does a git ls-files + OS walk — expensive on slow disks.
+# Cache the result for 60 s so checkbox clicks don't retrigger a full scan.
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _list_files(repo_root_str: str) -> list:
+    return get_tracked_files(Path(repo_root_str))
+
+
 # ─── Session state ──────────────────────────────────────────────────────
 
 if "generated_patch" not in st.session_state:
@@ -876,7 +885,7 @@ if current_side == "a":
         )
 
         try:
-            all_files = get_tracked_files(repo_root)
+            all_files = _list_files(str(repo_root))
         except Exception as e:
             st.error(f"❌ Kunne ikke liste filer: {e}")
             st.stop()

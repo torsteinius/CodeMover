@@ -17,6 +17,7 @@ import io
 import subprocess
 import tempfile
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -125,21 +126,42 @@ def get_tracked_files(repo_root: Path) -> list[str]:
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
 
-    # ── Pass 2: OS walk — always runs ────────────────────────────────────
+    # ── Pass 2: OS walk — always runs, with timeout ──────────────────────
     # Picks up untracked .py/.sql (and all other TEXT_EXTENSIONS) files.
-    for path in sorted(repo_root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(repo_root)
-        rel_str = rel.as_posix()
-        suffix = path.suffix.lower()
+    # Uses os.walk(topdown=True) so we can prune skip-dirs BEFORE descending
+    # into them — prevents hangs on node_modules, .venv, large build trees, etc.
+    # Hard timeout: on slow disks we stop walking and return what git gave us.
+    _WALK_TIMEOUT = 8.0   # seconds
+    _walk_start   = time.monotonic()
 
-        if suffix in NEVER_TRANSFER_EXTENSIONS:
-            continue
-        if _is_excluded_path(rel_str, rel.parts):
-            continue
-        if is_text_file(path):
-            seen.add(rel_str)
+    for dirpath, dirnames, filenames in os.walk(repo_root, topdown=True, followlinks=False):
+        if time.monotonic() - _walk_start > _WALK_TIMEOUT:
+            break  # return what we have; Pass 1 (git ls-files) still covered tracked files
+
+        # Prune in-place: os.walk will not descend into removed entries
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".")
+            and d not in SKIP_DIRS
+            and d not in {"_code_mover_backups", "_code_mover_patches"}
+        ]
+
+        cur_dir = Path(dirpath)
+        for filename in filenames:
+            full_path = cur_dir / filename
+            try:
+                rel = full_path.relative_to(repo_root)
+            except ValueError:
+                continue
+            rel_str = rel.as_posix()
+            suffix  = full_path.suffix.lower()
+
+            if suffix in NEVER_TRANSFER_EXTENSIONS:
+                continue
+            if filename.startswith("."):
+                continue
+            if is_text_file(full_path):
+                seen.add(rel_str)
 
     return sorted(seen)
 
