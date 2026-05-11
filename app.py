@@ -11,8 +11,9 @@ Sync state (last synced commit hash) is stored in
 inside each repository.
 """
 
+import re
 import streamlit as st
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime
 
 from core import (
@@ -475,7 +476,6 @@ if current_side == "a":
             st.stop()
 
         # ── Bygg mappestruktur ───────────────────────────────────────────
-        from pathlib import PurePosixPath
         from collections import defaultdict
 
         folders: dict[str, list[str]] = defaultdict(list)
@@ -677,49 +677,156 @@ if current_side == "b":
                 except Exception as e:
                     st.error(f"❌ Kunne ikke lese fil: {e}")
 
-        # ── Preview + Apply ─────────────────────────────────────────────
+        # ── Auto-detect format and apply ────────────────────────────────
         if patch_text.strip():
-            preview = preview_format_patch(patch_text)
+            is_full_load = (
+                "----==============" in patch_text
+                and not patch_text.strip().startswith("From ")
+            )
 
-            with st.expander("🔍 Forhåndsvis patch", expanded=True):
-                if preview["commits"]:
-                    st.write("**Commits som vil bli applisert:**")
-                    for c in preview["commits"]:
-                        st.write(f"• `{c['hash']}` {c['subject']}")
-                if preview["files_changed"]:
-                    st.write(f"**{len(preview['files_changed'])} fil(er) endres:**")
-                    for f in preview["files_changed"]:
-                        st.write(f"• `{f}`")
+            # ── FULL LOAD FORMAT ─────────────────────────────────────────
+            if is_full_load:
+                st.info(
+                    "📦 **Full load-format detektert** — dette er en tekstblokk med råfiler, "
+                    "ikke en git patch. Filene vil bli skrevet direkte til disk."
+                )
 
-            st.divider()
+                # Parse file list (without writing yet)
+                _blocks = re.split(
+                    r"^----==============\s+(.+)$", patch_text, flags=re.MULTILINE
+                )
+                fl_files = []
+                _i = 1
+                while _i < len(_blocks) - 1:
+                    fp = _blocks[_i].strip()
+                    # Strip leading "PATH: ..." line if present (from export format)
+                    content_lines = _blocks[_i + 1].lstrip("\n")
+                    if fp:
+                        fl_files.append(fp)
+                    _i += 2
 
-            if st.button("🚀 Apply patch", type="primary", use_container_width=True):
-                try:
-                    with st.spinner("Kjører git am..."):
-                        output = apply_format_patch(repo_root, patch_text)
+                if not fl_files:
+                    st.warning("⚠️ Ingen filer funnet i teksten.")
+                else:
+                    existing_files = [f for f in fl_files if (repo_root / f).exists()]
+                    new_files      = [f for f in fl_files if not (repo_root / f).exists()]
+                    new_dirs       = sorted({
+                        str(PurePosixPath(f).parent)
+                        for f in new_files
+                        if str(PurePosixPath(f).parent) != "."
+                        and not (repo_root / PurePosixPath(f).parent).exists()
+                    })
 
-                    # Find the new HEAD after apply
-                    new_head = get_current_commit(repo_root)
-                    save_sync_state(repo_root, new_head)
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Filer i blokken", len(fl_files))
+                    col2.metric("Finnes allerede", len(existing_files))
+                    col3.metric("Nye filer", len(new_files))
 
-                    add_to_history(
-                        repo_root,
-                        status="applied",
-                        side="b",
-                        since_hash=last_sync or "",
-                        head_hash=new_head,
-                        commits=preview["commits"],
-                        description=patch_meta.get("description", ""),
-                    )
+                    ok_to_proceed = True
+                    pct_match = len(existing_files) / len(fl_files)
 
-                    st.success("✅ Patch applisert!")
-                    st.caption(f"Ny HEAD: `{new_head[:12]}`")
-                    if output:
-                        st.code(output)
-                    st.balloons()
+                    # Warn if barely anything matches — likely wrong repo / path
+                    if len(fl_files) > 3 and pct_match < 0.30:
+                        st.error(
+                            f"⚠️ Kun **{len(existing_files)} av {len(fl_files)}** filer "
+                            f"finnes i `{repo_root.name}`. "
+                            "Dette kan bety at du er i feil repo eller feil mappe."
+                        )
+                        ok_to_proceed = st.checkbox(
+                            "Jeg er sikker på at dette er rett sted — skriv filene likevel",
+                            key="fl_confirm_wrong_repo",
+                        )
+                    else:
+                        if new_dirs:
+                            st.warning(
+                                "📁 Disse mappene finnes ikke og vil bli opprettet: "
+                                + ", ".join(f"`{d}`" for d in new_dirs)
+                            )
+                        if new_files:
+                            with st.expander(
+                                f"ℹ️ {len(new_files)} ny(e) fil(er) vil bli opprettet"
+                            ):
+                                for f in new_files:
+                                    st.write(f"• `{f}`")
+                        if existing_files:
+                            with st.expander(
+                                f"♻️ {len(existing_files)} eksisterende fil(er) vil bli overskrevet"
+                            ):
+                                for f in existing_files:
+                                    st.write(f"• `{f}`")
 
-                except Exception as e:
-                    st.error(f"❌ Apply feilet:\n\n{e}")
+                    st.divider()
+                    if ok_to_proceed:
+                        if st.button(
+                            "📦 Skriv filer til disk",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                with st.spinner("Skriver filer..."):
+                                    results = parse_and_apply_files_text(
+                                        patch_text, repo_root
+                                    )
+                                written = [r for r in results if r["status"] == "written"]
+                                errors  = [r for r in results if r["status"] == "error"]
+                                if written:
+                                    st.success(
+                                        f"✅ {len(written)} fil(er) skrevet til "
+                                        f"`{repo_root.name}`"
+                                    )
+                                if errors:
+                                    st.error(f"❌ {len(errors)} feil:")
+                                    for r in errors:
+                                        st.write(
+                                            f"• `{r['path']}`: {r.get('error', 'ukjent feil')}"
+                                        )
+                                if written and not errors:
+                                    st.balloons()
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
+            # ── GIT FORMAT-PATCH ─────────────────────────────────────────
+            else:
+                preview = preview_format_patch(patch_text)
+
+                with st.expander("🔍 Forhåndsvis patch", expanded=True):
+                    if preview["commits"]:
+                        st.write("**Commits som vil bli applisert:**")
+                        for c in preview["commits"]:
+                            st.write(f"• `{c['hash']}` {c['subject']}")
+                    if preview["files_changed"]:
+                        st.write(f"**{len(preview['files_changed'])} fil(er) endres:**")
+                        for f in preview["files_changed"]:
+                            st.write(f"• `{f}`")
+
+                st.divider()
+
+                if st.button("🚀 Apply patch", type="primary", use_container_width=True):
+                    try:
+                        with st.spinner("Kjører git am..."):
+                            output = apply_format_patch(repo_root, patch_text)
+
+                        new_head = get_current_commit(repo_root)
+                        save_sync_state(repo_root, new_head)
+
+                        add_to_history(
+                            repo_root,
+                            status="applied",
+                            side="b",
+                            since_hash=last_sync or "",
+                            head_hash=new_head,
+                            commits=preview["commits"],
+                            description=patch_meta.get("description", ""),
+                        )
+
+                        st.success("✅ Patch applisert!")
+                        st.caption(f"Ny HEAD: `{new_head[:12]}`")
+                        if output:
+                            st.code(output)
+                        st.balloons()
+
+                    except Exception as e:
+                        st.error(f"❌ Apply feilet:\n\n{e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -773,27 +880,44 @@ if current_side == "a":
                     with st.spinner("Leser filer..."):
                         full_text = export_files_as_text(repo_root, selected_files)
                     st.session_state["full_load_text"] = full_text
+                    st.session_state["full_load_file_count"] = len(selected_files)
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ {e}")
 
         if st.session_state.get("full_load_text"):
-            full_text = st.session_state["full_load_text"]
+            full_text       = st.session_state["full_load_text"]
+            fl_file_count   = st.session_state.get("full_load_file_count", "?")
 
             st.divider()
             st.subheader("✅ Full load-tekst klar")
-            st.caption(f"{len(selected_files)} fil(er) · {len(full_text)} tegn")
 
-            st.markdown(
-                f'<div style="max-height:500px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;">',
-                unsafe_allow_html=True,
+            col_info, col_dl, col_clear = st.columns([5, 2, 1])
+            with col_info:
+                st.caption(
+                    f"{fl_file_count} fil(er) · {len(full_text):,} tegn — "
+                    "marker alt i tekstboksen og kopier (Ctrl+A / ⌘+A)"
+                )
+            with col_dl:
+                st.download_button(
+                    "💾 Last ned .txt",
+                    data=full_text,
+                    file_name=f"full_load_{repo_root.name}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            with col_clear:
+                if st.button("🗑️", use_container_width=True, help="Fjern teksten"):
+                    st.session_state["full_load_text"] = None
+                    st.session_state["full_load_file_count"] = 0
+                    st.rerun()
+
+            st.text_area(
+                "full_load_display",
+                value=full_text,
+                height=420,
+                label_visibility="collapsed",
             )
-            st.code(full_text, language="text", line_numbers=False)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            if st.button("🗑️ Fjern", use_container_width=True):
-                st.session_state["full_load_text"] = None
-                st.rerun()
         else:
             st.info("💡 Velg filer over og trykk 'Generer full load-tekst'")
 
