@@ -12,6 +12,8 @@ inside each repository.
 """
 
 import re
+import math
+import time
 import streamlit as st
 from pathlib import Path, PurePosixPath
 from datetime import datetime
@@ -457,7 +459,44 @@ def _folder_select(files: list, value: bool, prefix: str) -> None:
         st.session_state[_cb_key(prefix, f)] = value
 
 
-def _render_file_tree(files: list, key_prefix: str) -> list:
+_AGE_MIN_S  = 3_600          # ≤ 1 h   → fully red
+_AGE_MAX_S  = 3 * 86_400     # ≥ 3 days → white / no indicator
+_AGE_DECAY  = 2.5            # exponential decay constant (tweak to taste)
+
+
+def _file_age_color(path: Path) -> str:
+    """Return a CSS rgb() color based on how recently a file was modified.
+
+    Scale (exponential, not linear):
+      ≤ 1 hour   → rgb(255, 0, 0)        fully red
+      ≥ 3 days   → ""                    no indicator (white / transparent)
+      In between → exponential fade      rgb(255, g, g) with g rising quickly
+                                         as age grows, so the red zone is
+                                         concentrated near the 1-hour mark.
+
+    Returns empty string if the file can't be stat'd or is old enough to be
+    colourless.
+    """
+    try:
+        age_s = time.time() - path.stat().st_mtime
+    except OSError:
+        return ""
+
+    if age_s <= _AGE_MIN_S:
+        redness = 1.0
+    elif age_s >= _AGE_MAX_S:
+        return ""
+    else:
+        # n = 0 at 1 h, 1 at 3 days
+        n = (age_s - _AGE_MIN_S) / (_AGE_MAX_S - _AGE_MIN_S)
+        # Exponential: fast drop from 1.0 near n=0, nearly 0 by n=1
+        redness = math.exp(-_AGE_DECAY * n)
+
+    other = int(255 * (1.0 - redness))   # 0 = full red, 255 = white
+    return f"rgb(255, {other}, {other})"
+
+
+def _render_file_tree(files: list, key_prefix: str, repo_root: Path | None = None) -> list:
     """Render a folder-tree checkbox picker and return the selected files.
 
     Args:
@@ -503,9 +542,15 @@ def _render_file_tree(files: list, key_prefix: str) -> list:
             )
 
         for f in files_in_folder:
+            color = _file_age_color(repo_root / f) if repo_root else ""
             col_indent, col_cb = st.columns([1, 11])
             with col_indent:
-                st.write("")
+                if color:
+                    st.markdown(
+                        f'<div style="background-color:{color};width:10px;height:1.25em;'
+                        f'border-radius:2px;margin-top:3px;" title="Nylig endret"></div>',
+                        unsafe_allow_html=True,
+                    )
             with col_cb:
                 st.checkbox(PurePosixPath(f).name, key=_cb_key(key_prefix, f))
 
@@ -538,7 +583,7 @@ if current_side == "a":
             st.stop()
 
         # ── Trevisning med checkboxer ────────────────────────────────────
-        selected_files = _render_file_tree(changed_files, "ef")
+        selected_files = _render_file_tree(changed_files, "ef", repo_root)
 
         st.divider()
         st.caption(f"**{len(selected_files)}** av {len(changed_files)} fil(er) valgt")
@@ -850,7 +895,7 @@ if current_side == "a":
         st.caption(f"Viser {len(filtered)} av {len(all_files)} fil(er)")
 
         # ── Trevisning med checkboxer ────────────────────────────────────
-        selected_files = _render_file_tree(filtered, "fl")
+        selected_files = _render_file_tree(filtered, "fl", repo_root)
 
         # ── Generer tekst ───────────────────────────────────────────────
         st.divider()

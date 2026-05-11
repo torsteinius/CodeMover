@@ -404,7 +404,11 @@ def parse_and_apply_files_text(text: str, target_dir: Path) -> list[dict]:
         if not file_path:
             continue
 
-        # Remove leading/trailing blank lines from content
+        # Strip leading newlines, then remove the PATH: header line added by
+        # export_files_as_text (first non-empty line starting with "PATH: ").
+        content = content.lstrip("\n")
+        if content.startswith("PATH: "):
+            content = content.split("\n", 1)[1] if "\n" in content else ""
         content = content.strip("\n")
 
         full_path = target_dir / file_path
