@@ -64,6 +64,29 @@ NEVER_TRANSFER_EXTENSIONS = {
 }
 
 
+# ─── Git subprocess helper ───────────────────────────────────────────────
+
+
+def _run_git(*args, cwd: str) -> subprocess.CompletedProcess:
+    """Run a git command and guarantee stdout/stderr are always str, never None.
+
+    With capture_output=True + text=True Python should always give strings, but
+    on some platforms or when git exits via signal the pipe can come back None.
+    Normalising here means every caller can safely call .strip()/.splitlines().
+    """
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout is None:
+        result.stdout = ""
+    if result.stderr is None:
+        result.stderr = ""
+    return result
+
+
 # ─── Helpers ────────────────────────────────────────────────────────────
 
 
@@ -106,11 +129,7 @@ def get_tracked_files(repo_root: Path) -> list[str]:
 
     # ── Pass 1: git ls-files ─────────────────────────────────────────────
     try:
-        result = subprocess.run(
-            ["git", "ls-files"],
-            cwd=str(repo_root),
-            capture_output=True, text=True, timeout=10,
-        )
+        result = _run_git("ls-files", cwd=str(repo_root))
         if result.returncode == 0:
             for f in result.stdout.splitlines():
                 f = f.strip()
@@ -213,11 +232,7 @@ def check_is_git_repo(repo_root: Path) -> bool:
 
 def get_current_commit(repo_root: Path) -> str:
     """Return the current HEAD commit hash (full SHA)."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(repo_root),
-        capture_output=True, text=True,
-    )
+    result = _run_git("rev-parse", "HEAD", cwd=str(repo_root))
     if result.returncode != 0:
         raise RuntimeError(f"git rev-parse HEAD feilet: {result.stderr.strip()}")
     return result.stdout.strip()
@@ -225,10 +240,9 @@ def get_current_commit(repo_root: Path) -> str:
 
 def get_commits_since(repo_root: Path, since_hash: str) -> list[dict]:
     """Return commits reachable from HEAD but not from since_hash, oldest first."""
-    result = subprocess.run(
-        ["git", "log", f"{since_hash}..HEAD", "--oneline", "--no-decorate", "--reverse"],
+    result = _run_git(
+        "log", f"{since_hash}..HEAD", "--oneline", "--no-decorate", "--reverse",
         cwd=str(repo_root),
-        capture_output=True, text=True,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git log feilet: {result.stderr.strip()}")
@@ -243,11 +257,7 @@ def get_commits_since(repo_root: Path, since_hash: str) -> list[dict]:
 
 def get_uncommitted_files(repo_root: Path) -> list[dict]:
     """Return files with uncommitted changes (staged + unstaged)."""
-    result = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=str(repo_root),
-        capture_output=True, text=True,
-    )
+    result = _run_git("status", "--porcelain", cwd=str(repo_root))
     if result.returncode != 0:
         return []
     files = []
@@ -268,11 +278,7 @@ def get_changed_files_since(repo_root: Path, since_hash: str) -> list[str]:
     - hidden path components
     """
     base = since_hash if since_hash else _EMPTY_TREE
-    result = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}..HEAD"],
-        cwd=str(repo_root),
-        capture_output=True, text=True,
-    )
+    result = _run_git("diff", "--name-only", f"{base}..HEAD", cwd=str(repo_root))
     if result.returncode != 0:
         return []
 
@@ -331,11 +337,7 @@ def get_file_content(repo_root: Path, file_path: str) -> str:
     if full_path.exists():
         return full_path.read_text(encoding="utf-8")
     # Fallback: try to read from git HEAD
-    result = subprocess.run(
-        ["git", "show", f"HEAD:{file_path}"],
-        cwd=str(repo_root),
-        capture_output=True, text=True,
-    )
+    result = _run_git("show", f"HEAD:{file_path}", cwd=str(repo_root))
     if result.returncode != 0:
         raise RuntimeError(f"Kunne ikke lese {file_path}: {result.stderr.strip()}")
     return result.stdout
@@ -460,11 +462,7 @@ def generate_format_patch(repo_root: Path, since_hash: Optional[str] = None) -> 
         RuntimeError on git errors or if there is nothing to patch.
     """
     base = since_hash if since_hash else _EMPTY_TREE
-    result = subprocess.run(
-        ["git", "format-patch", f"{base}..HEAD", "--stdout"],
-        cwd=str(repo_root),
-        capture_output=True, text=True,
-    )
+    result = _run_git("format-patch", f"{base}..HEAD", "--stdout", cwd=str(repo_root))
     if result.returncode != 0:
         raise RuntimeError(f"git format-patch feilet:\n{result.stderr.strip()}")
     if not result.stdout.strip():
@@ -492,11 +490,9 @@ def generate_format_patch_for_files(
         RuntimeError on git errors or if there is nothing to patch.
     """
     base = since_hash if since_hash else _EMPTY_TREE
-    cmd = ["git", "format-patch", f"{base}..HEAD", "--stdout", "--"] + selected_files
-    result = subprocess.run(
-        cmd,
+    result = _run_git(
+        "format-patch", f"{base}..HEAD", "--stdout", "--", *selected_files,
         cwd=str(repo_root),
-        capture_output=True, text=True,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git format-patch feilet:\n{result.stderr.strip()}")
@@ -569,11 +565,7 @@ def apply_format_patch(repo_root: Path, patch_text: str) -> str:
         tmp_path = tf.name
 
     try:
-        result = subprocess.run(
-            ["git", "am", "--keep-cr", "--3way", tmp_path],
-            cwd=str(repo_root),
-            capture_output=True, text=True,
-        )
+        result = _run_git("am", "--keep-cr", "--3way", tmp_path, cwd=str(repo_root))
         if result.returncode != 0:
             subprocess.run(
                 ["git", "am", "--abort"],
