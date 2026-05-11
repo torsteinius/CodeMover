@@ -1,5 +1,4 @@
 # Code Mover
-<!-- LLM_PATCH_TEST: modern patch format works -->
 Git-based code transfer for isolated/offline environments.
 
 ## Purpose

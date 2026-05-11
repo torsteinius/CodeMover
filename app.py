@@ -967,234 +967,260 @@ if current_side == "b":
         st.subheader("🤖 LLM Patch — motta patch fra ChatGPT / annen LLM")
         st.caption(
             "Lim inn en patch generert av en LLM i **LLM Patch Format**. "
-            "Dette er en enkel tekst med `----====== FILE: <sti>`-separatorer. "
-            "Ingen git, ingen commit-historikk — bare filene skrives direkte til disk."
+            "For eksisterende filer brukes små blokkendringer med `PATCH`, "
+            "`INSERT_AFTER`, `INSERT_BEFORE` eller `DELETE_BLOCK`. "
+            "`FILE` brukes kun for nye filer, og `OVERWRITE` bare ved eksplisitt "
+            "full erstatning av en eksisterende fil."
         )
 
         with st.expander("📖 Hvordan få en LLM til å lage denne patchen?"):
-            st.markdown(
-                "Gi LLM-en denne instruksen:\n\n"
-                "> Bruk **LLM Patch Format** for Code Mover. "
-                "Hver fil skal ha en delimiter `----====== FILE: <relativ sti>` på en egen linje, "
-                "etterfulgt av hele filinnholdet. For sletting: `----====== DELETE: <sti>`. "
-                "Se `LLM_PATCH_FORMAT.md` for full spesifikasjon.\n\n"
-                "Du kan også laste ned [LLM_PATCH_FORMAT.md](LLM_PATCH_FORMAT.md) og laste den opp "
-                "til LLM-en som kontekst."
+            llm_instruction = "\n".join([
+                "Bruk LLM Patch Format for Code Mover.",
+                "",
+                "Viktig:",
+                "- Ikke send hele eksisterende filer.",
+                "- For eksisterende filer skal du sende små blokkendringer.",
+                "- Bruk FILE kun for nye filer.",
+                "- Bruk OVERWRITE bare hvis hele eksisterende fil eksplisitt skal erstattes.",
+                "- FIND-blokker må være eksakte og finnes nøyaktig én gang i filen.",
+                "- Ikke bruk \"... resten uendret\" eller andre forkortelser.",
+                "",
+                "Støttet format:",
+                "",
+                "1) Erstatt en eksisterende kodeblokk:",
+                "----====== PATCH: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "REPLACE:",
+                "<ny tekst>",
+                "",
+                "2) Sett inn etter en eksisterende blokk:",
+                "----====== INSERT_AFTER: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "INSERT:",
+                "<tekst som skal settes inn etter FIND-blokken>",
+                "",
+                "3) Sett inn før en eksisterende blokk:",
+                "----====== INSERT_BEFORE: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "INSERT:",
+                "<tekst som skal settes inn før FIND-blokken>",
+                "",
+                "4) Slett en eksisterende blokk:",
+                "----====== DELETE_BLOCK: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst som skal fjernes>",
+                "",
+                "5) Opprett ny fil:",
+                "----====== FILE: path/to/new_file.py",
+                "<hele innholdet i ny fil>",
+                "",
+                "6) Erstatt hel eksisterende fil, kun hvis eksplisitt nødvendig:",
+                "----====== OVERWRITE: path/to/existing_file.py",
+                "<hele filinnholdet>",
+                "",
+                "7) Slett fil:",
+                "----====== DELETE: path/to/file.py",
+                "",
+                "Når du lager patch:",
+                "- Bruk relative filstier.",
+                "- Del opp endringer i flere små operasjoner hvis det er tryggere.",
+                "- Velg FIND-blokker som er lange nok til å være unike.",
+                "- Hvis du ikke har nok kontekst til å lage en eksakt FIND-blokk, be om relevant utdrag av filen først.",
+            ])
+
+            st.markdown("Gi LLM-en denne instruksen:")
+            st.code(llm_instruction, language="text")
+            st.caption(
+                "Tips: Last også opp `LLM_PATCH_FORMAT.md` til LLM-en hvis du vil gi full kontekst."
             )
 
         st.divider()
 
-        # ── Input ───────────────────────────────────────────────────────
         llm_patch_text = st.text_area(
             "Lim inn LLM-patch her",
             height=400,
-            placeholder="----====== FILE: src/utils/helpers.py\nimport json\nfrom pathlib import Path\n\n...",
+            placeholder=(
+                "----====== PATCH: app.py\n"
+                "@@\n"
+                "FIND:\n"
+                "gammel kode\n\n"
+                "REPLACE:\n"
+                "ny kode\n"
+            ),
             key="llm_patch_input",
         )
 
         if llm_patch_text.strip():
-            has_modern_llm_operation = (
-                re.search(
-                    r"^----======\s+"
-                    r"(OVERWRITE|PATCH|INSERT_AFTER|INSERT_BEFORE|DELETE_BLOCK)"
-                    r":\s+.+$",
-                    llm_patch_text,
-                    flags=re.MULTILINE,
-                )
-                is not None
+            action_pattern = (
+                r"^----======\s+"
+                r"(FILE|OVERWRITE|DELETE|PATCH|INSERT_AFTER|INSERT_BEFORE|DELETE_BLOCK)"
+                r":\s+(.+)$"
             )
 
-            if has_modern_llm_operation:
-                st.info(
-                    "🤖 Nytt LLM Patch-format detektert. "
-                    "Patchen appliseres med Code Movers interne patchmotor."
-                )
+            _blocks = re.split(action_pattern, llm_patch_text, flags=re.MULTILINE)
 
-                if st.button(
-                    "🤖 Apply modern LLM patch",
-                    type="primary",
-                    use_container_width=True,
-                    key="llm_apply_modern_patch",
-                ):
-                    try:
-                        with st.spinner("Appliserer LLM patch..."):
-                            results = parse_llm_patch(llm_patch_text, repo_root)
+            operations = []
+            _i = 1
+            while _i < len(_blocks) - 2:
+                action = _blocks[_i].strip().upper()
+                fp = _blocks[_i + 1].strip()
+                body = _blocks[_i + 2]
+                if fp:
+                    operations.append({"action": action, "path": fp, "body": body})
+                _i += 3
 
-                        created = [r for r in results if r["status"] == "created"]
-                        overwritten = [r for r in results if r["status"] == "overwritten"]
-                        patched = [r for r in results if r["status"] == "patched"]
-                        inserted_after = [r for r in results if r["status"] == "inserted_after"]
-                        inserted_before = [r for r in results if r["status"] == "inserted_before"]
-                        deleted_block = [r for r in results if r["status"] == "deleted_block"]
-                        deleted = [r for r in results if r["status"] == "deleted"]
-                        written = [r for r in results if r["status"] == "written"]
-                        errors = [r for r in results if r["status"] == "error"]
-
-                        changed_count = (
-                            len(created)
-                            + len(overwritten)
-                            + len(patched)
-                            + len(inserted_after)
-                            + len(inserted_before)
-                            + len(deleted_block)
-                            + len(deleted)
-                            + len(written)
-                        )
-
-                        if changed_count:
-                            st.success(
-                                f"✅ {changed_count} operasjon(er) utført i "
-                                f"`{repo_root.name}`"
-                            )
-
-                        if created:
-                            st.write(f"🆕 {len(created)} fil(er) opprettet")
-                        if overwritten:
-                            st.write(f"♻️ {len(overwritten)} fil(er) overskrevet")
-                        if patched:
-                            st.write(f"🔧 {len(patched)} blokk(er) erstattet")
-                        if inserted_after:
-                            st.write(f"➕ {len(inserted_after)} insert-after utført")
-                        if inserted_before:
-                            st.write(f"➕ {len(inserted_before)} insert-before utført")
-                        if deleted_block:
-                            st.write(f"✂️ {len(deleted_block)} blokk(er) slettet")
-                        if deleted:
-                            st.write(f"🗑️ {len(deleted)} fil(er) slettet")
-                        if written:
-                            st.write(f"📝 {len(written)} fil(er) skrevet")
-
-                        if errors:
-                            st.error(f"❌ {len(errors)} feil:")
-                            for r in errors:
-                                st.write(
-                                    f"• `{r['path']}`: {r.get('error', 'ukjent feil')}"
-                                )
-
-                        if changed_count and not errors:
-                            st.balloons()
-
-                    except Exception as e:
-                        st.error(f"❌ {e}")
-
-                st.stop()            # Quick format validation
-            has_file_delimiter = "----====== FILE:" in llm_patch_text
-            has_delete_delimiter = "----====== DELETE:" in llm_patch_text
-
-            if not (has_file_delimiter or has_delete_delimiter):
+            if not operations:
                 st.warning(
-                    "⚠️ Fant ingen `----====== FILE:` eller `----====== DELETE:`-delimiter. "
-                    "Er dette i LLM Patch Format?"
+                    "⚠️ Fant ingen gyldige LLM Patch-operasjoner. "
+                    "Forventet `FILE`, `OVERWRITE`, `DELETE`, `PATCH`, "
+                    "`INSERT_AFTER`, `INSERT_BEFORE` eller `DELETE_BLOCK`."
                 )
             else:
-                # Preview what will happen
+                create_files = [op["path"] for op in operations if op["action"] == "FILE"]
+                overwrite_files = [op["path"] for op in operations if op["action"] == "OVERWRITE"]
+                delete_files = [op["path"] for op in operations if op["action"] == "DELETE"]
+                patch_files = [
+                    op["path"]
+                    for op in operations
+                    if op["action"] in {"PATCH", "INSERT_AFTER", "INSERT_BEFORE", "DELETE_BLOCK"}
+                ]
+
+                existing_create_files = [f for f in create_files if (repo_root / f).exists()]
+                missing_patch_files = [f for f in patch_files if not (repo_root / f).exists()]
+                missing_delete_files = [f for f in delete_files if not (repo_root / f).exists()]
+
+                all_written_like = create_files + overwrite_files + patch_files
+                new_dirs = sorted({
+                    str(PurePosixPath(f).parent)
+                    for f in all_written_like
+                    if str(PurePosixPath(f).parent) != "."
+                    and not (repo_root / PurePosixPath(f).parent).exists()
+                })
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("🔧 Blokk-endringer", len(patch_files))
+                col2.metric("🆕 Nye filer", len(create_files))
+                col3.metric("♻️ Overwrite", len(overwrite_files))
+                col4.metric("🗑️ Slett", len(delete_files))
+
+                with st.expander("🔍 Operasjoner i patchen", expanded=True):
+                    for op in operations:
+                        exists = (repo_root / op["path"]).exists()
+                        exists_label = "finnes" if exists else "ny/mangler"
+                        st.write(f"• `{op['action']}` `{op['path']}` — {exists_label}")
+
+                ok_to_proceed = True
+
+                if existing_create_files:
+                    st.error(
+                        "`FILE` kan bare brukes for nye filer. Disse filene finnes allerede:"
+                    )
+                    for f in existing_create_files:
+                        st.write(f"• `{f}`")
+                    ok_to_proceed = False
+
+                if missing_patch_files:
+                    st.error("Disse blokk-endringene peker på filer som ikke finnes:")
+                    for f in missing_patch_files:
+                        st.write(f"• `{f}`")
+                    ok_to_proceed = False
+
+                if missing_delete_files:
+                    st.warning("Disse filene er markert for sletting, men finnes ikke:")
+                    for f in missing_delete_files:
+                        st.write(f"• `{f}`")
+
+                if new_dirs:
+                    st.warning(
+                        "Disse mappene finnes ikke og vil bli opprettet: "
+                        + ", ".join(f"`{d}`" for d in new_dirs)
+                    )
+
+                if overwrite_files:
+                    ok_to_proceed = st.checkbox(
+                        "Jeg forstår at `OVERWRITE` erstatter hele filer",
+                        key="llm_confirm_overwrite",
+                    ) and ok_to_proceed
+
                 st.divider()
 
-                # Parse to get file list (without writing)
-                _pattern = r"^----======\s+(FILE|DELETE):\s+(.+)$"
-                _blocks = re.split(_pattern, llm_patch_text, flags=re.MULTILINE)
-                llm_files = []
-                llm_deletes = []
-                _i = 1
-                while _i < len(_blocks) - 2:
-                    action = _blocks[_i].strip().upper()
-                    fp = _blocks[_i + 1].strip()
-                    if action == "FILE" and fp:
-                        llm_files.append(fp)
-                    elif action == "DELETE" and fp:
-                        llm_deletes.append(fp)
-                    _i += 3
+                if ok_to_proceed:
+                    if st.button(
+                        "🤖 Apply LLM patch",
+                        type="primary",
+                        use_container_width=True,
+                        key="llm_apply_patch_modern",
+                    ):
+                        try:
+                            with st.spinner("Appliserer LLM patch..."):
+                                results = parse_llm_patch(llm_patch_text, repo_root)
 
-                if not llm_files and not llm_deletes:
-                    st.warning("⚠️ Ingen filer funnet i patchen.")
-                else:
-                    existing_files = [f for f in llm_files if (repo_root / f).exists()]
-                    new_files      = [f for f in llm_files if not (repo_root / f).exists()]
-                    new_dirs       = sorted({
-                        str(PurePosixPath(f).parent)
-                        for f in new_files
-                        if str(PurePosixPath(f).parent) != "."
-                        and not (repo_root / PurePosixPath(f).parent).exists()
-                    })
+                            created = [r for r in results if r["status"] == "created"]
+                            overwritten = [r for r in results if r["status"] == "overwritten"]
+                            patched = [r for r in results if r["status"] == "patched"]
+                            inserted_after = [r for r in results if r["status"] == "inserted_after"]
+                            inserted_before = [r for r in results if r["status"] == "inserted_before"]
+                            deleted_block = [r for r in results if r["status"] == "deleted_block"]
+                            deleted = [r for r in results if r["status"] == "deleted"]
+                            written = [r for r in results if r["status"] == "written"]
+                            errors = [r for r in results if r["status"] == "error"]
 
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("📝 Skrives", len(llm_files))
-                    col2.metric("🗑️ Slettes", len(llm_deletes))
-                    col3.metric("Finnes fra før", len(existing_files))
-                    col4.metric("🆕 Nye filer", len(new_files))
-
-                    ok_to_proceed = True
-                    pct_match = len(existing_files) / len(llm_files) if llm_files else 1.0
-
-                    if len(llm_files) > 3 and pct_match < 0.30:
-                        st.error(
-                            f"⚠️ Kun **{len(existing_files)} av {len(llm_files)}** filer "
-                            f"finnes i `{repo_root.name}`. "
-                            "Dette kan bety at du er i feil repo eller feil mappe."
-                        )
-                        ok_to_proceed = st.checkbox(
-                            "Jeg er sikker — skriv filene likevel",
-                            key="llm_confirm_wrong_repo",
-                        )
-                    else:
-                        if new_dirs:
-                            st.warning(
-                                "📁 Disse mappene finnes ikke og vil bli opprettet: "
-                                + ", ".join(f"`{d}`" for d in new_dirs)
+                            changed_count = (
+                                len(created)
+                                + len(overwritten)
+                                + len(patched)
+                                + len(inserted_after)
+                                + len(inserted_before)
+                                + len(deleted_block)
+                                + len(deleted)
+                                + len(written)
                             )
-                        if new_files:
-                            with st.expander(
-                                f"ℹ️ {len(new_files)} ny(e) fil(er) vil bli opprettet"
-                            ):
-                                for f in new_files:
-                                    st.write(f"• `{f}`")
-                        if existing_files:
-                            with st.expander(
-                                f"♻️ {len(existing_files)} eksisterende fil(er) vil bli overskrevet"
-                            ):
-                                for f in existing_files:
-                                    st.write(f"• `{f}`")
-                        if llm_deletes:
-                            with st.expander(
-                                f"🗑️ {len(llm_deletes)} fil(er) vil bli slettet"
-                            ):
-                                for f in llm_deletes:
-                                    st.write(f"• `{f}`")
 
-                    st.divider()
-                    if ok_to_proceed:
-                        if st.button(
-                            "🤖 Apply LLM patch",
-                            type="primary",
-                            use_container_width=True,
-                        ):
-                            try:
-                                with st.spinner("Skriver filer..."):
-                                    results = parse_llm_patch(llm_patch_text, repo_root)
+                            if changed_count:
+                                st.success(
+                                    f"✅ {changed_count} operasjon(er) utført i "
+                                    f"`{repo_root.name}`"
+                                )
 
-                                written = [r for r in results if r["status"] == "written"]
-                                deleted = [r for r in results if r["status"] == "deleted"]
-                                errors  = [r for r in results if r["status"] == "error"]
+                            if created:
+                                st.write(f"🆕 {len(created)} fil(er) opprettet")
+                            if overwritten:
+                                st.write(f"♻️ {len(overwritten)} fil(er) overskrevet")
+                            if patched:
+                                st.write(f"🔧 {len(patched)} blokk(er) erstattet")
+                            if inserted_after:
+                                st.write(f"➕ {len(inserted_after)} insert-after utført")
+                            if inserted_before:
+                                st.write(f"➕ {len(inserted_before)} insert-before utført")
+                            if deleted_block:
+                                st.write(f"✂️ {len(deleted_block)} blokk(er) slettet")
+                            if deleted:
+                                st.write(f"🗑️ {len(deleted)} fil(er) slettet")
+                            if written:
+                                st.write(f"📝 {len(written)} fil(er) skrevet")
 
-                                if written:
-                                    st.success(
-                                        f"✅ {len(written)} fil(er) skrevet til "
-                                        f"`{repo_root.name}`"
+                            if errors:
+                                st.error(f"❌ {len(errors)} feil:")
+                                for r in errors:
+                                    st.write(
+                                        f"• `{r['path']}`: {r.get('error', 'ukjent feil')}"
                                     )
-                                if deleted:
-                                    st.info(
-                                        f"🗑️ {len(deleted)} fil(er) slettet"
-                                    )
-                                if errors:
-                                    st.error(f"❌ {len(errors)} feil:")
-                                    for r in errors:
-                                        st.write(
-                                            f"• `{r['path']}`: {r.get('error', 'ukjent feil')}"
-                                        )
-                                if written and not errors:
-                                    st.balloons()
-                            except Exception as e:
-                                st.error(f"❌ {e}")
+
+                            if changed_count and not errors:
+                                st.balloons()
+
+                        except Exception as e:
+                            st.error(f"❌ {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
