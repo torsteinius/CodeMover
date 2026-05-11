@@ -1,2 +1,3 @@
 streamlit>=1.28.0
 pyyaml>=6.0
+streamlit-tree-select>=0.0.5

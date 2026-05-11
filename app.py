@@ -12,12 +12,10 @@ inside each repository.
 """
 
 import re
-import math
 import time
 import streamlit as st
 from pathlib import Path, PurePosixPath
 from datetime import datetime
-from collections import defaultdict
 
 from core import (
     # Repo
@@ -454,116 +452,109 @@ if current_side == "a":
 # SIDE A — Enkeltfiler
 # ═══════════════════════════════════════════════════════════════════════
 
-# ─── Shared file-tree picker ────────────────────────────────────────────────
+# ─── Shared file-tree picker (streamlit-tree-select) ────────────────────────
 
 
-def _cb_key(prefix: str, filepath: str) -> str:
-    """Session-state key for a file checkbox."""
-    return f"{prefix}_cb_{filepath}"
+def _age_emoji(path: Path) -> str:
+    """Return a coloured circle emoji indicating how recently the file was saved.
 
-
-def _folder_select(files: list, value: bool, prefix: str) -> None:
-    """on_click callback — set all checkboxes in a folder to True/False."""
-    for f in files:
-        st.session_state[_cb_key(prefix, f)] = value
-
-
-_AGE_MIN_S  = 3_600          # ≤ 1 h   → fully red
-_AGE_MAX_S  = 3 * 86_400     # ≥ 3 days → white / no indicator
-_AGE_DECAY  = 2.5            # exponential decay constant (tweak to taste)
-
-
-def _file_age_color(path: Path) -> str:
-    """Return a CSS rgb() color based on how recently a file was modified.
-
-    Scale (exponential, not linear):
-      ≤ 1 hour   → rgb(255, 0, 0)        fully red
-      ≥ 3 days   → ""                    no indicator (white / transparent)
-      In between → exponential fade      rgb(255, g, g) with g rising quickly
-                                         as age grows, so the red zone is
-                                         concentrated near the 1-hour mark.
-
-    Returns empty string if the file can't be stat'd or is old enough to be
-    colourless.
+    🔴  ≤ 1 h      (very hot — just edited)
+    🟠  1–6 h
+    🟡  6–24 h
+    ⚪  1–3 days
+       (none)  > 3 days
     """
     try:
         age_s = time.time() - path.stat().st_mtime
     except OSError:
         return ""
+    if age_s <= 3_600:    return "🔴 "
+    if age_s <= 21_600:   return "🟠 "
+    if age_s <= 86_400:   return "🟡 "
+    if age_s <= 259_200:  return "⚪ "
+    return ""
 
-    if age_s <= _AGE_MIN_S:
-        redness = 1.0
-    elif age_s >= _AGE_MAX_S:
-        return ""
-    else:
-        # n = 0 at 1 h, 1 at 3 days
-        n = (age_s - _AGE_MIN_S) / (_AGE_MAX_S - _AGE_MIN_S)
-        # Exponential: fast drop from 1.0 near n=0, nearly 0 by n=1
-        redness = math.exp(-_AGE_DECAY * n)
 
-    other = int(255 * (1.0 - redness))   # 0 = full red, 255 = white
-    return f"rgb(255, {other}, {other})"
+def _build_tree_nodes(files: list, repo_root: Path | None = None) -> list:
+    """Convert a flat sorted file list into nested nodes for tree_select.
+
+    Folders become parent nodes (value prefixed with ``__dir__``).
+    Files become leaf nodes whose value is the relative path string.
+    """
+    def _insert(node: dict, parts: tuple, full_path: str) -> None:
+        if len(parts) == 1:
+            node["files"].append(full_path)
+        else:
+            node["dirs"].setdefault(parts[0], {"files": [], "dirs": {}})
+            _insert(node["dirs"][parts[0]], parts[1:], full_path)
+
+    root: dict = {"files": [], "dirs": {}}
+    for f in sorted(files):
+        _insert(root, PurePosixPath(f).parts, f)
+
+    def _to_nodes(node: dict, dir_path: str = "") -> list:
+        result = []
+        for dirname in sorted(node["dirs"]):
+            child_path = f"{dir_path}/{dirname}" if dir_path else dirname
+            result.append({
+                "label": f"📁 {dirname}",
+                "value": f"__dir__{child_path}",
+                "children": _to_nodes(node["dirs"][dirname], child_path),
+            })
+        for f in node["files"]:
+            emoji = _age_emoji(repo_root / f) if repo_root else ""
+            result.append({
+                "label": f"{emoji}{PurePosixPath(f).name}",
+                "value": f,
+            })
+        return result
+
+    return _to_nodes(root)
 
 
 def _render_file_tree(files: list, key_prefix: str, repo_root: Path | None = None) -> list:
-    """Render a folder-tree checkbox picker and return the selected files.
+    """Render a recursive checkbox tree and return selected file paths.
+
+    Uses streamlit-tree-select so folders can be expanded/collapsed and an
+    entire branch can be selected with a single click.
+    File age is shown as a coloured emoji next to each filename.
 
     Args:
         files:      Flat sorted list of relative file paths.
-        key_prefix: Unique prefix for widget keys, e.g. ``"ef"`` or ``"fl"``.
-                    Using different prefixes for Enkeltfiler vs Full Load keeps
-                    their session-state checkbox values independent.
+        key_prefix: ``"ef"`` for Enkeltfiler, ``"fl"`` for Full Load.
+                    Keeps the two trees' selections independent.
 
     Returns:
-        List of file paths whose checkboxes are currently checked.
+        List of selected file paths (leaf values only, no ``__dir__`` entries).
     """
-    folders: dict[str, list] = defaultdict(list)
-    for f in files:
-        parent = str(PurePosixPath(f).parent)
-        folders["" if parent == "." else parent].append(f)
+    from streamlit_tree_select import tree_select
 
-    for folder in sorted(folders.keys()):
-        files_in_folder = sorted(folders[folder])
-        label  = "**(rot)**"   if folder == "" else f"**{folder}/**"
-        icon   = "📄"          if folder == "" else "📁"
-        id_    = "root"        if folder == "" else folder
+    if not files:
+        st.info("Ingen filer funnet.")
+        return []
 
-        col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
-        with col_icon:
-            st.write(icon)
-        with col_name:
-            st.write(label)
-        with col_all:
-            st.button(
-                "Velg alle",
-                key=f"{key_prefix}_all_{id_}",
-                on_click=_folder_select,
-                args=(files_in_folder, True, key_prefix),
-                use_container_width=True,
-            )
-        with col_none:
-            st.button(
-                "Ingen",
-                key=f"{key_prefix}_none_{id_}",
-                on_click=_folder_select,
-                args=(files_in_folder, False, key_prefix),
-                use_container_width=True,
-            )
+    nodes = _build_tree_nodes(files, repo_root)
 
-        for f in files_in_folder:
-            color = _file_age_color(repo_root / f) if repo_root else ""
-            col_indent, col_cb = st.columns([1, 11])
-            with col_indent:
-                if color:
-                    st.markdown(
-                        f'<div style="background-color:{color};width:10px;height:1.25em;'
-                        f'border-radius:2px;margin-top:3px;" title="Nylig endret"></div>',
-                        unsafe_allow_html=True,
-                    )
-            with col_cb:
-                st.checkbox(PurePosixPath(f).name, key=_cb_key(key_prefix, f))
+    # Restore previous checkbox + expand state so selections survive reruns
+    prev_checked  = st.session_state.get(f"{key_prefix}_checked", [])
+    prev_expanded = st.session_state.get(f"{key_prefix}_expanded", [])
 
-    return [f for f in files if st.session_state.get(_cb_key(key_prefix, f), False)]
+    result = tree_select(
+        nodes,
+        check_model="leaf",       # checked[] contains only file (leaf) values
+        checked=prev_checked,
+        expanded=prev_expanded,
+        show_expand_all=True,
+        key=f"{key_prefix}_tree",
+    )
+
+    checked  = (result or {}).get("checked",  prev_checked)
+    expanded = (result or {}).get("expanded", prev_expanded)
+    st.session_state[f"{key_prefix}_checked"]  = checked
+    st.session_state[f"{key_prefix}_expanded"] = expanded
+
+    # Filter out any __dir__ values that might appear with check_model="all"
+    return [v for v in checked if not v.startswith("__dir__")]
 
 if current_side == "a":
     with tab_files:
