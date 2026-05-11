@@ -15,6 +15,7 @@ import re
 import streamlit as st
 from pathlib import Path, PurePosixPath
 from datetime import datetime
+from collections import defaultdict
 
 from core import (
     # Repo
@@ -442,12 +443,73 @@ if current_side == "a":
 # SIDE A — Enkeltfiler
 # ═══════════════════════════════════════════════════════════════════════
 
-def _ef_key(f: str) -> str:
-    return f"ef_cb_{f}"
+# ─── Shared file-tree picker ────────────────────────────────────────────────
 
-def _folder_select(files: list, value: bool) -> None:
+
+def _cb_key(prefix: str, filepath: str) -> str:
+    """Session-state key for a file checkbox."""
+    return f"{prefix}_cb_{filepath}"
+
+
+def _folder_select(files: list, value: bool, prefix: str) -> None:
+    """on_click callback — set all checkboxes in a folder to True/False."""
     for f in files:
-        st.session_state[_ef_key(f)] = value
+        st.session_state[_cb_key(prefix, f)] = value
+
+
+def _render_file_tree(files: list, key_prefix: str) -> list:
+    """Render a folder-tree checkbox picker and return the selected files.
+
+    Args:
+        files:      Flat sorted list of relative file paths.
+        key_prefix: Unique prefix for widget keys, e.g. ``"ef"`` or ``"fl"``.
+                    Using different prefixes for Enkeltfiler vs Full Load keeps
+                    their session-state checkbox values independent.
+
+    Returns:
+        List of file paths whose checkboxes are currently checked.
+    """
+    folders: dict[str, list] = defaultdict(list)
+    for f in files:
+        parent = str(PurePosixPath(f).parent)
+        folders["" if parent == "." else parent].append(f)
+
+    for folder in sorted(folders.keys()):
+        files_in_folder = sorted(folders[folder])
+        label  = "**(rot)**"   if folder == "" else f"**{folder}/**"
+        icon   = "📄"          if folder == "" else "📁"
+        id_    = "root"        if folder == "" else folder
+
+        col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
+        with col_icon:
+            st.write(icon)
+        with col_name:
+            st.write(label)
+        with col_all:
+            st.button(
+                "Velg alle",
+                key=f"{key_prefix}_all_{id_}",
+                on_click=_folder_select,
+                args=(files_in_folder, True, key_prefix),
+                use_container_width=True,
+            )
+        with col_none:
+            st.button(
+                "Ingen",
+                key=f"{key_prefix}_none_{id_}",
+                on_click=_folder_select,
+                args=(files_in_folder, False, key_prefix),
+                use_container_width=True,
+            )
+
+        for f in files_in_folder:
+            col_indent, col_cb = st.columns([1, 11])
+            with col_indent:
+                st.write("")
+            with col_cb:
+                st.checkbox(PurePosixPath(f).name, key=_cb_key(key_prefix, f))
+
+    return [f for f in files if st.session_state.get(_cb_key(key_prefix, f), False)]
 
 if current_side == "a":
     with tab_files:
@@ -475,82 +537,8 @@ if current_side == "a":
             st.info("Ingen endrede filer siden sist sync.")
             st.stop()
 
-        # ── Bygg mappestruktur ───────────────────────────────────────────
-        from collections import defaultdict
-
-        folders: dict[str, list[str]] = defaultdict(list)
-        for f in changed_files:
-            parent = str(PurePosixPath(f).parent)
-            folder_key = "" if parent == "." else parent
-            folders[folder_key].append(f)
-
-        # Sorter: rot-nivå filer øverst, deretter mapper alfabetisk
-        sorted_folders = sorted(folders.keys(), key=lambda k: ("" if k == "" else k))
-
         # ── Trevisning med checkboxer ────────────────────────────────────
-        for folder in sorted_folders:
-            files_in_folder = sorted(folders[folder])
-
-            if folder:
-                # Mappeheader med velg/fjern-alle knapper
-                col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
-                with col_icon:
-                    st.write("📁")
-                with col_name:
-                    st.write(f"**{folder}/**")
-                with col_all:
-                    st.button(
-                        "Velg alle",
-                        key=f"ef_all_{folder}",
-                        on_click=_folder_select,
-                        args=(files_in_folder, True),
-                        use_container_width=True,
-                    )
-                with col_none:
-                    st.button(
-                        "Ingen",
-                        key=f"ef_none_{folder}",
-                        on_click=_folder_select,
-                        args=(files_in_folder, False),
-                        use_container_width=True,
-                    )
-            else:
-                # Rot-nivå: bare en liten header
-                col_icon, col_name, col_all, col_none = st.columns([1, 5, 2, 2])
-                with col_icon:
-                    st.write("📄")
-                with col_name:
-                    st.write("**(rot)**")
-                with col_all:
-                    st.button(
-                        "Velg alle",
-                        key="ef_all_root",
-                        on_click=_folder_select,
-                        args=(files_in_folder, True),
-                        use_container_width=True,
-                    )
-                with col_none:
-                    st.button(
-                        "Ingen",
-                        key="ef_none_root",
-                        on_click=_folder_select,
-                        args=(files_in_folder, False),
-                        use_container_width=True,
-                    )
-
-            # Filer under denne mappen
-            for f in files_in_folder:
-                col_indent, col_cb = st.columns([1, 11])
-                with col_indent:
-                    st.write("")   # innrykk
-                with col_cb:
-                    st.checkbox(
-                        PurePosixPath(f).name,
-                        key=_ef_key(f),
-                    )
-
-        # ── Saml valgte filer fra session state ──────────────────────────
-        selected_files = [f for f in changed_files if st.session_state.get(_ef_key(f), False)]
+        selected_files = _render_file_tree(changed_files, "ef")
 
         st.divider()
         st.caption(f"**{len(selected_files)}** av {len(changed_files)} fil(er) valgt")
@@ -861,14 +849,8 @@ if current_side == "a":
 
         st.caption(f"Viser {len(filtered)} av {len(all_files)} fil(er)")
 
-        # ── Velg filer med checkboxer ───────────────────────────────────
-        selected_files = []
-        cols = st.columns(3)
-        for i, file_path in enumerate(filtered):
-            col = cols[i % 3]
-            with col:
-                if st.checkbox(file_path, key=f"load_file_{file_path}"):
-                    selected_files.append(file_path)
+        # ── Trevisning med checkboxer ────────────────────────────────────
+        selected_files = _render_file_tree(filtered, "fl")
 
         # ── Generer tekst ───────────────────────────────────────────────
         st.divider()
