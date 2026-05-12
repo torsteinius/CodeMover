@@ -560,6 +560,21 @@ def _render_file_tree(files: list, key_prefix: str, repo_root: Path | None = Non
     # Strip __dir__ sentinel values — keep only actual file paths
     return [v for v in checked if not v.startswith("__dir__")]
 
+
+def _filter_files_by_age(files: list[str], repo_root: Path, age_seconds: float) -> list[str]:
+    """Return only files modified within the last ``age_seconds`` seconds."""
+    now = time.time()
+    result = []
+    for f in files:
+        full_path = repo_root / f
+        try:
+            if full_path.exists() and (now - full_path.stat().st_mtime) <= age_seconds:
+                result.append(f)
+        except OSError:
+            pass
+    return result
+
+
 if current_side == "a":
     with tab_files:
         st.subheader("📁 Velg enkeltfiler å overføre")
@@ -586,8 +601,29 @@ if current_side == "a":
             st.info("Ingen endrede filer siden sist sync.")
             st.stop()
 
+        # ── Tidsfilter ──────────────────────────────────────────────────
+        st.caption("⏱️ Filtrer på sist endret:")
+        age_cols = st.columns([1, 1, 1, 4])
+        age_filter = None
+        with age_cols[0]:
+            if st.button("🕐 Siste time", use_container_width=True, key="ef_age_1h"):
+                age_filter = 3_600
+        with age_cols[1]:
+            if st.button("📅 Siste døgn", use_container_width=True, key="ef_age_24h"):
+                age_filter = 86_400
+        with age_cols[2]:
+            if st.button("📆 Siste uke", use_container_width=True, key="ef_age_7d"):
+                age_filter = 604_800
+
+        display_files = changed_files
+        if age_filter is not None:
+            filtered = _filter_files_by_age(changed_files, repo_root, age_filter)
+            if len(filtered) < len(changed_files):
+                st.info(f"Viser {len(filtered)} av {len(changed_files)} fil(er) — {len(changed_files) - len(filtered)} eldre fil(er) skjult")
+            display_files = filtered
+
         # ── Trevisning med checkboxer ────────────────────────────────────
-        selected_files = _render_file_tree(changed_files, "ef", repo_root)
+        selected_files = _render_file_tree(display_files, "ef", repo_root)
 
         st.divider()
         st.caption(f"**{len(selected_files)}** av {len(changed_files)} fil(er) valgt")
@@ -1247,12 +1283,32 @@ if current_side == "a":
             st.info("Ingen tracked text-filer funnet.")
             st.stop()
 
+        # ── Tidsfilter ──────────────────────────────────────────────────
+        st.caption("⏱️ Filtrer på sist endret:")
+        age_cols = st.columns([1, 1, 1, 4])
+        age_filter = None
+        with age_cols[0]:
+            if st.button("🕐 Siste time", use_container_width=True, key="fl_age_1h"):
+                age_filter = 3_600
+        with age_cols[1]:
+            if st.button("📅 Siste døgn", use_container_width=True, key="fl_age_24h"):
+                age_filter = 86_400
+        with age_cols[2]:
+            if st.button("📆 Siste uke", use_container_width=True, key="fl_age_7d"):
+                age_filter = 604_800
+
         # ── Filtrering ──────────────────────────────────────────────────
         filter_text = st.text_input("🔍 Filtrer filer", placeholder="f.eks. .py eller core/")
         if filter_text:
             filtered = [f for f in all_files if filter_text.lower() in f.lower()]
         else:
             filtered = all_files
+
+        if age_filter is not None:
+            age_filtered = _filter_files_by_age(filtered, repo_root, age_filter)
+            if len(age_filtered) < len(filtered):
+                st.info(f"Viser {len(age_filtered)} av {len(filtered)} fil(er) — {len(filtered) - len(age_filtered)} eldre fil(er) skjult")
+            filtered = age_filtered
 
         st.caption(f"Viser {len(filtered)} av {len(all_files)} fil(er)")
 
