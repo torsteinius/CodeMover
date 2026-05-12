@@ -477,6 +477,23 @@ def _age_emoji(path: Path) -> str:
     return ""
 
 
+def _age_text(path: Path) -> str:
+    """Return a human-readable relative age string like '2t 15m' or '3d 4t'."""
+    try:
+        age_s = int(time.time() - path.stat().st_mtime)
+    except OSError:
+        return ""
+    if age_s < 60:
+        return f"{age_s}s"
+    if age_s < 3_600:
+        return f"{age_s // 60}m"
+    if age_s < 86_400:
+        return f"{age_s // 3_600}t {(age_s % 3_600) // 60}m"
+    if age_s < 604_800:
+        return f"{age_s // 86_400}d {(age_s % 86_400) // 3_600}t"
+    return f"{age_s // 86_400}d"
+
+
 def _build_tree_nodes(files: list, repo_root: Path | None = None) -> list:
     """Convert a flat sorted file list into nested nodes for tree_select.
 
@@ -505,8 +522,12 @@ def _build_tree_nodes(files: list, repo_root: Path | None = None) -> list:
             })
         for f in node["files"]:
             emoji = _age_emoji(repo_root / f) if repo_root else ""
+            age_label = _age_text(repo_root / f) if repo_root else ""
+            label = f"{emoji}{PurePosixPath(f).name}"
+            if age_label:
+                label += f" <span style='color:#888;font-size:0.8em'>— {age_label} siden</span>"
             result.append({
-                "label": f"{emoji}{PurePosixPath(f).name}",
+                "label": label,
                 "value": f,
             })
         return result
@@ -620,6 +641,8 @@ if current_side == "a":
             filtered = _filter_files_by_age(changed_files, repo_root, age_filter)
             if len(filtered) < len(changed_files):
                 st.info(f"Viser {len(filtered)} av {len(changed_files)} fil(er) — {len(changed_files) - len(filtered)} eldre fil(er) skjult")
+            # Auto-check all filtered files
+            st.session_state["ef_checked"] = list(filtered)
             display_files = filtered
 
         # ── Trevisning med checkboxer ────────────────────────────────────
@@ -1308,6 +1331,8 @@ if current_side == "a":
             age_filtered = _filter_files_by_age(filtered, repo_root, age_filter)
             if len(age_filtered) < len(filtered):
                 st.info(f"Viser {len(age_filtered)} av {len(filtered)} fil(er) — {len(filtered) - len(age_filtered)} eldre fil(er) skjult")
+            # Auto-check all filtered files
+            st.session_state["fl_checked"] = list(age_filtered)
             filtered = age_filtered
 
         st.caption(f"Viser {len(filtered)} av {len(all_files)} fil(er)")
