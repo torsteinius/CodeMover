@@ -525,7 +525,7 @@ def _build_tree_nodes(files: list, repo_root: Path | None = None) -> list:
             age_label = _age_text(repo_root / f) if repo_root else ""
             label = f"{emoji}{PurePosixPath(f).name}"
             if age_label:
-                label += f" <span style='color:#888;font-size:0.8em'>— {age_label} siden</span>"
+                label += f"  ─ {age_label}"
             result.append({
                 "label": label,
                 "value": f,
