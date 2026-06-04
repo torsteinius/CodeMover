@@ -512,6 +512,7 @@ def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
             parts.append(
                 f"----============== {file_path}\n"
                 f"PATH: {file_path}\n"
+                f"SIZE: {len(content)}\n"
                 f"{content}"
             )
         except Exception as e:
@@ -524,19 +525,10 @@ def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
     return "\n\n".join(parts)
 
 
-def parse_and_apply_files_text(text: str, target_dir: Path) -> list[dict]:
-    """Parse a text block with ----============== separators and write files to disk.
+def _parse_files_text_blocks(text: str) -> list[dict]:
+    """Parse full-load text into {path, content} blocks."""
+    files = []
 
-    Args:
-        text:        The text block from export_files_as_text.
-        target_dir:  Root directory where files will be written.
-
-    Returns:
-        List of dicts with {path, status, error?} for each file.
-    """
-    results = []
-
-    # Split on the separator pattern
     blocks = re.split(r"^----==============\s+(.+)$", text, flags=re.MULTILINE)
 
     # blocks[0] is preamble (empty or ignored)
@@ -558,10 +550,84 @@ def parse_and_apply_files_text(text: str, target_dir: Path) -> list[dict]:
         if content.startswith("PATH: "):
             content = content.split("\n", 1)[1] if "\n" in content else ""
 
-        content = content.strip("\n")
+        if re.match(r"^SIZE:\s+\d+\n", content):
+            size_line, _, content = content.partition("\n")
+            content = content[: int(size_line.removeprefix("SIZE: ").strip())]
+        else:
+            content = content.strip("\n")
+        files.append({"path": file_path, "content": content})
+
+    return files
+
+
+def _same_except_trailing_whitespace(left: str, right: str) -> bool:
+    """Return True when only whitespace at the very end differs."""
+    return left.rstrip(" \t\r\n") == right.rstrip(" \t\r\n")
+
+
+def preview_files_text(text: str, target_dir: Path) -> list[dict]:
+    """Parse full-load text and classify what would happen without writing.
+
+    Returns:
+        List of dicts with {path, status, error?}. Status is one of:
+        new, identical, trailing_whitespace_only, changed, error.
+    """
+    results = []
+
+    for file_info in _parse_files_text_blocks(text):
+        file_path = file_info["path"]
+        content = file_info["content"]
 
         try:
             full_path = _safe_target_path(target_dir, file_path)
+            if not full_path.exists():
+                results.append({"path": file_path, "status": "new"})
+                continue
+
+            existing = _read_text_file(full_path)
+            if existing == content:
+                results.append({"path": file_path, "status": "identical"})
+            elif _same_except_trailing_whitespace(existing, content):
+                results.append(
+                    {"path": file_path, "status": "trailing_whitespace_only"}
+                )
+            else:
+                results.append({"path": file_path, "status": "changed"})
+        except Exception as e:
+            results.append({"path": file_path, "status": "error", "error": str(e)})
+
+    return results
+
+
+def parse_and_apply_files_text(text: str, target_dir: Path) -> list[dict]:
+    """Parse a text block with ----============== separators and write files to disk.
+
+    Args:
+        text:        The text block from export_files_as_text.
+        target_dir:  Root directory where files will be written.
+
+    Returns:
+        List of dicts with {path, status, error?} for each file.
+    """
+    results = []
+
+    for file_info in _parse_files_text_blocks(text):
+        file_path = file_info["path"]
+        content = file_info["content"]
+
+        try:
+            full_path = _safe_target_path(target_dir, file_path)
+            if full_path.exists():
+                existing = _read_text_file(full_path)
+                if existing == content:
+                    results.append({"path": file_path, "status": "identical"})
+                    continue
+                if _same_except_trailing_whitespace(existing, content):
+                    results.append(
+                        {"path": file_path, "status": "trailing_whitespace_only"}
+                    )
+                    continue
+
             _write_text_file(full_path, content)
             results.append({"path": file_path, "status": "written"})
         except Exception as e:

@@ -40,6 +40,7 @@ from core import (
     # File export
     export_selected_files,
     export_files_as_text,
+    preview_files_text,
     parse_and_apply_files_text,
     # LLM patch format
     parse_llm_patch,
@@ -64,6 +65,87 @@ from config import (
     get_active_repo,
     discover_repos,
 )
+
+
+def _group_results_by_status(results: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for result in results:
+        groups.setdefault(result.get("status", "unknown"), []).append(result)
+    return groups
+
+
+def _show_full_load_result_summary(results: list[dict]) -> dict[str, list[dict]]:
+    groups = _group_results_by_status(results)
+    written = groups.get("written", [])
+    identical = groups.get("identical", [])
+    trailing_only = groups.get("trailing_whitespace_only", [])
+    errors = groups.get("error", [])
+
+    skipped = len(identical) + len(trailing_only)
+    if written:
+        st.success(f"✅ {len(written)} fil(er) skrevet.")
+    if skipped:
+        st.info(f"✅ {skipped} fil(er) var allerede på plass og ble ikke skrevet.")
+    if errors:
+        st.error(f"❌ {len(errors)} feil:")
+        for r in errors:
+            st.write(f"• `{r['path']}`: {r.get('error', 'ukjent feil')}")
+
+    return groups
+
+
+def _show_full_load_preview(results: list[dict], repo_root: Path) -> dict[str, list[dict]]:
+    groups = _group_results_by_status(results)
+    new_files = groups.get("new", [])
+    identical = groups.get("identical", [])
+    trailing_only = groups.get("trailing_whitespace_only", [])
+    changed = groups.get("changed", [])
+    errors = groups.get("error", [])
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Filer", len(results))
+    col2.metric("Nye", len(new_files))
+    col3.metric("Identiske", len(identical))
+    col4.metric("Kun slutt-space", len(trailing_only))
+    col5.metric("Endres", len(changed))
+
+    new_dirs = sorted({
+        str(PurePosixPath(r["path"]).parent)
+        for r in new_files
+        if str(PurePosixPath(r["path"]).parent) != "."
+        and not (repo_root / PurePosixPath(r["path"]).parent).exists()
+    })
+
+    if new_dirs:
+        st.warning(
+            "Disse mappene finnes ikke og vil bli opprettet: "
+            + ", ".join(f"`{d}`" for d in new_dirs)
+        )
+    if new_files:
+        with st.expander(f"ℹ️ {len(new_files)} ny(e) fil(er) vil bli opprettet"):
+            for r in new_files:
+                st.write(f"• `{r['path']}`")
+    if changed:
+        with st.expander(f"♻️ {len(changed)} eksisterende fil(er) vil bli skrevet"):
+            for r in changed:
+                st.write(f"• `{r['path']}`")
+    if identical:
+        with st.expander(f"✅ {len(identical)} identiske fil(er) hoppes over"):
+            for r in identical:
+                st.write(f"• `{r['path']}`")
+    if trailing_only:
+        with st.expander(
+            f"✅ {len(trailing_only)} fil(er) avviker bare helt på slutten"
+        ):
+            for r in trailing_only:
+                st.write(f"• `{r['path']}`")
+    if errors:
+        st.error(f"❌ {len(errors)} ugyldige fil(er):")
+        for r in errors:
+            st.write(f"• `{r['path']}`: {r.get('error', 'ukjent feil')}")
+
+    return groups
+
 
 st.set_page_config(page_title="Code Mover", layout="wide")
 st.title("📦 Code Mover")
@@ -891,8 +973,9 @@ if current_side == "b":
                     if fp:
                         fl_files.append(fp)
                     _i += 2
+                preview_results = preview_files_text(patch_text, repo_root)
 
-                if not fl_files:
+                if not preview_results:
                     st.warning("⚠️ Ingen filer funnet i teksten.")
                 else:
                     existing_files = [f for f in fl_files if (repo_root / f).exists()]
@@ -908,14 +991,20 @@ if current_side == "b":
                     col1.metric("Filer i blokken", len(fl_files))
                     col2.metric("Finnes allerede", len(existing_files))
                     col3.metric("Nye filer", len(new_files))
+                    preview_groups = _show_full_load_preview(preview_results, repo_root)
+                    existing_count = (
+                        len(preview_groups.get("identical", []))
+                        + len(preview_groups.get("trailing_whitespace_only", []))
+                        + len(preview_groups.get("changed", []))
+                    )
 
                     ok_to_proceed = True
-                    pct_match = len(existing_files) / len(fl_files)
+                    pct_match = existing_count / len(preview_results)
 
                     # Warn if barely anything matches — likely wrong repo / path
-                    if len(fl_files) > 3 and pct_match < 0.30:
+                    if len(preview_results) > 3 and pct_match < 0.30:
                         st.error(
-                            f"⚠️ Kun **{len(existing_files)} av {len(fl_files)}** filer "
+                            f"⚠️ Kun **{existing_count} av {len(preview_results)}** filer "
                             f"finnes i `{repo_root.name}`. "
                             "Dette kan bety at du er i feil repo eller feil mappe."
                         )
@@ -937,7 +1026,7 @@ if current_side == "b":
                                     st.write(f"• `{f}`")
                         if existing_files:
                             with st.expander(
-                                f"♻️ {len(existing_files)} eksisterende fil(er) vil bli overskrevet"
+                                f"♻️ {len(existing_files)} eksisterende fil(er) finnes fra før"
                             ):
                                 for f in existing_files:
                                     st.write(f"• `{f}`")
@@ -954,8 +1043,9 @@ if current_side == "b":
                                     results = parse_and_apply_files_text(
                                         patch_text, repo_root
                                     )
-                                written = [r for r in results if r["status"] == "written"]
-                                errors  = [r for r in results if r["status"] == "error"]
+                                result_groups = _show_full_load_result_summary(results)
+                                written = result_groups.get("written", [])
+                                errors = result_groups.get("error", [])
                                 if written:
                                     st.success(
                                         f"✅ {len(written)} fil(er) skrevet til "
@@ -1412,6 +1502,9 @@ if current_side == "b":
 
         if full_text.strip():
             st.divider()
+            preview_results = preview_files_text(full_text, repo_root)
+            if preview_results:
+                _show_full_load_preview(preview_results, repo_root)
             st.warning(
                 "⚠️ Dette vil **overskrive** filer på disk. "
                 "Sørg for at du har backup eller at filene er i git."
@@ -1422,8 +1515,9 @@ if current_side == "b":
                     with st.spinner("Skriver filer..."):
                         results = parse_and_apply_files_text(full_text, repo_root)
 
-                    written = [r for r in results if r["status"] == "written"]
-                    errors  = [r for r in results if r["status"] == "error"]
+                    result_groups = _show_full_load_result_summary(results)
+                    written = result_groups.get("written", [])
+                    errors = result_groups.get("error", [])
 
                     if written:
                         st.success(f"✅ {len(written)} fil(er) skrevet til `{repo_root}`:")
