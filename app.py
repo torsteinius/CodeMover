@@ -40,6 +40,7 @@ from core import (
     # File export
     export_selected_files,
     export_files_as_text,
+    validate_full_load_project,
     preview_files_text,
     parse_and_apply_files_text,
     # LLM patch format
@@ -147,6 +148,54 @@ def _show_full_load_preview(results: list[dict], repo_root: Path) -> dict[str, l
     return groups
 
 
+def _show_full_load_project_guard(text: str, repo_root: Path, key: str) -> bool:
+    validation = validate_full_load_project(text, repo_root)
+    source = validation["source"]
+    target = validation["target"]
+
+    if validation["status"] == "match":
+        st.success(
+            f"🔒 Prosjekt-fingeravtrykk matcher `{target['repo_name']}`."
+        )
+        return True
+
+    if validation["status"] == "weak_match":
+        st.warning(
+            f"Repo-/hovedmappenavn matcher `{target['repo_name']}`, "
+            "men Code Mover fant ingen felles ankerfiler å kontrollere. "
+            "Dette kan være riktig ved delvis full-load."
+        )
+        return st.checkbox(
+            "Jeg har manuelt sjekket at dette er riktig prosjekt",
+            key=f"{key}_weak_project_match",
+        )
+
+    if validation["status"] == "missing":
+        st.warning(
+            "⚠️ Full-load teksten mangler prosjekt-fingeravtrykk. "
+            "Dette er trolig en eldre pakke, så Code Mover kan ikke bekrefte "
+            "at dette er riktig prosjekt."
+        )
+        return st.checkbox(
+            "Jeg har manuelt sjekket at dette er riktig prosjekt",
+            key=f"{key}_missing_fingerprint",
+        )
+
+    st.error(
+        "⛔ Prosjekt-fingeravtrykk matcher ikke. "
+        "Dette ser ut som full-load fra et annet prosjekt."
+    )
+    st.write(
+        f"Pakke: `{source.get('source_repo', '?')}` · "
+        f"`{source.get('project_fingerprint', '?')[:12]}`"
+    )
+    st.write(
+        f"Dette repoet: `{target['repo_name']}` · "
+        f"`{target['fingerprint'][:12]}`"
+    )
+    return False
+
+
 st.set_page_config(page_title="Code Mover", layout="wide")
 st.title("📦 Code Mover")
 st.caption("Git-based code transfer for isolated environments")
@@ -201,11 +250,11 @@ with st.sidebar:
             )
             col_yes, col_no = st.columns(2)
             with col_yes:
-                if st.button("✅ Bekreft", use_container_width=True):
+                if st.button("✅ Bekreft", use_container_width=True, key="sidebar_side_change_confirm"):
                     set_side(new_side)
                     st.rerun()
             with col_no:
-                if st.button("❌ Avbryt", use_container_width=True):
+                if st.button("❌ Avbryt", use_container_width=True, key="sidebar_side_change_cancel"):
                     st.rerun()
         else:
             set_side(new_side)
@@ -270,7 +319,7 @@ with st.sidebar:
     with st.expander("➕ Legg til / fjern repo"):
 
         # Search button — results stored in session state so they survive reruns
-        if st.button("🔍 Søk etter repoer", use_container_width=True):
+        if st.button("🔍 Søk etter repoer", use_container_width=True, key="sidebar_repo_search"):
             with st.spinner("Søker..."):
                 found = discover_repos()
             # Filter out already-registered repos
@@ -311,7 +360,7 @@ with st.sidebar:
             placeholder="/Users/bruker/Documents/GitHub/mitt-repo",
             label_visibility="collapsed",
         )
-        if st.button("➕ Legg til", use_container_width=True, disabled=not manual_path.strip()):
+        if st.button("➕ Legg til", use_container_width=True, disabled=not manual_path.strip(), key="sidebar_repo_add_manual"):
             p = Path(manual_path.strip())
             if p.is_dir():
                 add_repo(p.name, str(p))
@@ -324,7 +373,7 @@ with st.sidebar:
         if repo_names:
             st.divider()
             to_remove = st.selectbox("Fjern repo", options=[""] + repo_names, key="remove_selector")
-            if to_remove and st.button("🗑️ Fjern", type="secondary", use_container_width=True):
+            if to_remove and st.button("🗑️ Fjern", type="secondary", use_container_width=True, key="sidebar_repo_remove"):
                 remove_repo(to_remove)
                 st.rerun()
 
@@ -421,7 +470,7 @@ if current_side == "a":
             placeholder="F.eks. 'Sprint 12 — IMO-normalisering og fleetpanel-fix'",
         )
 
-        if st.button("📤 Generer patch", type="primary", use_container_width=True):
+        if st.button("📤 Generer patch", type="primary", use_container_width=True, key="sender_generate_patch"):
             try:
                 with st.spinner("Kjører git format-patch..."):
                     patch_text = generate_format_patch(repo_root, last_sync)
@@ -472,7 +521,7 @@ if current_side == "a":
                 "Da lagres dette sync-punktet, og neste patch vil kun inneholde nye commits."
             )
 
-            if st.button("✅ Bekreft at patchen er overført", type="primary", use_container_width=True):
+            if st.button("✅ Bekreft at patchen er overført", type="primary", use_container_width=True, key="sender_confirm_patch_transferred"):
                 save_sync_state(repo_root, head_hash)
                 st.session_state["generated_patch"] = None
                 st.session_state["generated_meta"] = {}
@@ -992,13 +1041,18 @@ if current_side == "b":
                     col2.metric("Finnes allerede", len(existing_files))
                     col3.metric("Nye filer", len(new_files))
                     preview_groups = _show_full_load_preview(preview_results, repo_root)
+                    project_ok = _show_full_load_project_guard(
+                        patch_text,
+                        repo_root,
+                        "patch_tab_full_load",
+                    )
                     existing_count = (
                         len(preview_groups.get("identical", []))
                         + len(preview_groups.get("trailing_whitespace_only", []))
                         + len(preview_groups.get("changed", []))
                     )
 
-                    ok_to_proceed = True
+                    ok_to_proceed = project_ok
                     pct_match = existing_count / len(preview_results)
 
                     # Warn if barely anything matches — likely wrong repo / path
@@ -1037,6 +1091,7 @@ if current_side == "b":
                             "📦 Skriv filer til disk",
                             type="primary",
                             use_container_width=True,
+                            key="receiver_apply_full_load_text",
                         ):
                             try:
                                 with st.spinner("Skriver filer..."):
@@ -1078,7 +1133,7 @@ if current_side == "b":
 
                 st.divider()
 
-                if st.button("🚀 Apply patch", type="primary", use_container_width=True):
+                if st.button("🚀 Apply patch", type="primary", use_container_width=True, key="receiver_apply_format_patch"):
                     try:
                         with st.spinner("Kjører git am..."):
                             output = apply_format_patch(repo_root, patch_text)
@@ -1435,7 +1490,7 @@ if current_side == "a":
         if selected_files:
             st.success(f"✅ {len(selected_files)} fil(er) valgt")
 
-            if st.button("📦 Generer full load-tekst", type="primary", use_container_width=True):
+            if st.button("📦 Generer full load-tekst", type="primary", use_container_width=True, key="sender_generate_full_load_text"):
                 try:
                     with st.spinner("Leser filer..."):
                         full_text = export_files_as_text(repo_root, selected_files)
@@ -1467,7 +1522,7 @@ if current_side == "a":
                     use_container_width=True,
                 )
             with col_clear:
-                if st.button("🗑️", use_container_width=True, help="Fjern teksten"):
+                if st.button("🗑️", use_container_width=True, help="Fjern teksten", key="sender_clear_full_load_text"):
                     st.session_state["full_load_text"] = None
                     st.session_state["full_load_file_count"] = 0
                     st.rerun()
@@ -1505,12 +1560,17 @@ if current_side == "b":
             preview_results = preview_files_text(full_text, repo_root)
             if preview_results:
                 _show_full_load_preview(preview_results, repo_root)
+            project_ok = _show_full_load_project_guard(
+                full_text,
+                repo_root,
+                "full_load_tab",
+            )
             st.warning(
                 "⚠️ Dette vil **overskrive** filer på disk. "
                 "Sørg for at du har backup eller at filene er i git."
             )
 
-            if st.button("📦 Skriv filer til disk", type="primary", use_container_width=True):
+            if project_ok and st.button("📦 Skriv filer til disk", type="primary", use_container_width=True, key="receiver_full_load_tab_write_files"):
                 try:
                     with st.spinner("Skriver filer..."):
                         results = parse_and_apply_files_text(full_text, repo_root)

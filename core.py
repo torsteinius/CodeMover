@@ -11,6 +11,7 @@ Handles:
 """
 
 from pathlib import Path
+import hashlib
 import re
 import json
 import zipfile
@@ -272,6 +273,47 @@ def compute_file_structure_snapshot(repo_root: Path) -> str:
     return "\n".join(lines)
 
 
+def compute_project_fingerprint(repo_root: Path) -> dict:
+    """Return soft identity metadata for detecting wrong-project full loads."""
+    tracked_files = get_tracked_files(repo_root)
+    files_blob = "\n".join(tracked_files)
+    file_structure_hash = hashlib.sha256(files_blob.encode("utf-8")).hexdigest()
+    anchor_files = {}
+
+    for file_path in APP_ROOT_MARKERS:
+        full_path = repo_root / file_path
+        if full_path.exists() and full_path.is_file():
+            try:
+                content = full_path.read_bytes()
+            except OSError:
+                continue
+            anchor_files[file_path] = hashlib.sha256(content).hexdigest()
+
+    git_roots = ""
+    if check_is_git_repo(repo_root):
+        result = _run_git(
+            "rev-list",
+            "--max-parents=0",
+            "HEAD",
+            cwd=str(repo_root),
+        )
+        if result.returncode == 0:
+            git_roots = " ".join(sorted(result.stdout.split()))
+
+    identity = "\n".join([repo_root.name, *sorted(anchor_files.values())])
+    fingerprint = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    return {
+        "version": "2",
+        "repo_name": repo_root.name,
+        "fingerprint": fingerprint,
+        "anchor_files": anchor_files,
+        "git_roots": git_roots,
+        "file_structure_hash": file_structure_hash,
+        "file_count": str(len(tracked_files)),
+    }
+
+
 # ─── Repository Detection ───────────────────────────────────────────────
 
 
@@ -495,6 +537,24 @@ def export_selected_files(repo_root: Path, selected_files: list[str]) -> bytes:
 _FILE_SEPARATOR = "\n\n----============== {filnavn}\n\n"
 
 
+def _format_full_load_header(repo_root: Path, selected_files: list[str]) -> str:
+    metadata = compute_project_fingerprint(repo_root)
+    return "\n".join(
+        [
+            "# CODE_MOVER_FULL_LOAD v2",
+            f"# SOURCE_REPO: {metadata['repo_name']}",
+            f"# PROJECT_FINGERPRINT: {metadata['fingerprint']}",
+            "# PROJECT_CHECK: repo_name + shared anchor files",
+            f"# ANCHOR_FILES: {json.dumps(metadata['anchor_files'], sort_keys=True)}",
+            f"# GIT_ROOTS: {metadata['git_roots']}",
+            f"# FILE_STRUCTURE_HASH: {metadata['file_structure_hash']}",
+            f"# FILE_COUNT: {metadata['file_count']}",
+            f"# SELECTED_FILE_COUNT: {len(selected_files)}",
+            "",
+        ]
+    )
+
+
 def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
     """Combine selected files into a single text block with file separators.
 
@@ -504,7 +564,7 @@ def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
 
     This makes it easy to copy-paste between environments without git.
     """
-    parts = []
+    parts = [_format_full_load_header(repo_root, selected_files)]
 
     for file_path in selected_files:
         try:
@@ -523,6 +583,131 @@ def export_files_as_text(repo_root: Path, selected_files: list[str]) -> str:
             )
 
     return "\n\n".join(parts)
+
+
+def parse_full_load_metadata(text: str) -> dict:
+    """Parse optional full-load header metadata."""
+    metadata = {}
+    preamble = re.split(r"^----==============\s+.+$", text, maxsplit=1, flags=re.MULTILINE)[0]
+
+    for line in preamble.splitlines():
+        if not line.startswith("# "):
+            continue
+
+        body = line[2:]
+        if body == "CODE_MOVER_FULL_LOAD v2":
+            metadata["format"] = "CODE_MOVER_FULL_LOAD"
+            metadata["version"] = "2"
+            continue
+
+        key, sep, value = body.partition(":")
+        if sep:
+            metadata[key.strip().lower()] = value.strip()
+
+    return metadata
+
+
+def validate_full_load_project(text: str, target_dir: Path) -> dict:
+    """Compare full-load source metadata with the target project."""
+    source = parse_full_load_metadata(text)
+    target = compute_project_fingerprint(target_dir)
+
+    if not source.get("project_fingerprint"):
+        return {
+            "status": "missing",
+            "source": source,
+            "target": target,
+            "message": "Full-load teksten mangler prosjekt-fingeravtrykk.",
+        }
+
+    source_repo = source.get("source_repo", "")
+    source_git_roots = set(source.get("git_roots", "").split())
+    target_git_roots = set(target.get("git_roots", "").split())
+    shared_git_roots = sorted(source_git_roots.intersection(target_git_roots))
+
+    repo_name_matches = bool(source_repo and source_repo == target["repo_name"])
+    if source_repo and not repo_name_matches:
+        return {
+            "status": "mismatch",
+            "source": source,
+            "target": target,
+            "message": "Repo-/hovedmappenavn matcher ikke.",
+        }
+
+    try:
+        source_anchor_files = json.loads(source.get("anchor_files", "{}"))
+    except json.JSONDecodeError:
+        source_anchor_files = {}
+
+    target_anchor_files = target["anchor_files"]
+    shared_anchor_files = sorted(
+        set(source_anchor_files).intersection(target_anchor_files)
+    )
+    matching_anchor_files = [
+        file_path
+        for file_path in shared_anchor_files
+        if source_anchor_files[file_path] == target_anchor_files[file_path]
+    ]
+    mismatching_anchor_files = [
+        file_path
+        for file_path in shared_anchor_files
+        if source_anchor_files[file_path] != target_anchor_files[file_path]
+    ]
+
+    if repo_name_matches and shared_git_roots:
+        return {
+            "status": "match",
+            "source": source,
+            "target": target,
+            "shared_git_roots": shared_git_roots,
+            "shared_anchor_files": shared_anchor_files,
+            "matching_anchor_files": matching_anchor_files,
+            "mismatching_anchor_files": mismatching_anchor_files,
+            "message": "Repo-/hovedmappenavn og git-historikk matcher.",
+        }
+
+    if matching_anchor_files:
+        return {
+            "status": "match",
+            "source": source,
+            "target": target,
+            "shared_anchor_files": shared_anchor_files,
+            "matching_anchor_files": matching_anchor_files,
+            "mismatching_anchor_files": mismatching_anchor_files,
+            "message": "Repo-navn og minst én felles ankerfil matcher.",
+        }
+
+    if repo_name_matches:
+        return {
+            "status": "match",
+            "source": source,
+            "target": target,
+            "shared_anchor_files": shared_anchor_files,
+            "matching_anchor_files": matching_anchor_files,
+            "mismatching_anchor_files": mismatching_anchor_files,
+            "message": "Repo-/hovedmappenavn matcher.",
+        }
+
+    if shared_anchor_files:
+        return {
+            "status": "mismatch",
+            "source": source,
+            "target": target,
+            "shared_anchor_files": shared_anchor_files,
+            "matching_anchor_files": matching_anchor_files,
+            "mismatching_anchor_files": mismatching_anchor_files,
+            "message": "Repo-navn matcher, men felles ankerfiler er ulike.",
+        }
+
+    return {
+        "status": "mismatch",
+        "source": source,
+        "target": target,
+        "shared_anchor_files": shared_anchor_files,
+        "matching_anchor_files": matching_anchor_files,
+        "mismatching_anchor_files": mismatching_anchor_files,
+        "message": "Full-load teksten ser ut til å komme fra et annet prosjekt.",
+    }
 
 
 def _parse_files_text_blocks(text: str) -> list[dict]:
