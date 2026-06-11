@@ -400,8 +400,8 @@ if current_side == "a":
         ["📤 Generer patch", "📁 Enkeltfiler", "📦 Full load", "📜 Historikk"]
     )
 else:
-    tab_apply, tab_llm, tab_load, tab_history = st.tabs(
-        ["📥 Apply patch", "🤖 LLM Patch", "📦 Full load", "📜 Historikk"]
+    tab_apply, tab_history = st.tabs(
+        ["📥 Mottak", "📜 Historikk"]
     )
 
 
@@ -745,29 +745,31 @@ def _today_at_0500_ts() -> float:
 
 
 def _render_time_filter(key_prefix: str):
-    choice = st.selectbox(
-        "⏱️ Filtrer på sist endret:",
-        [
-            "Alle filer",
-            "Siste time",
-            "Siste 2 timer",
-            "Siste 4 timer",
-            "Siste døgn",
-            "Siste uke",
-            "Siden 05:00 i dag",
-        ],
-        key=f"{key_prefix}_time_filter",
-    )
-    age_options = {
-        "Siste time": 3_600,
-        "Siste 2 timer": 7_200,
-        "Siste 4 timer": 14_400,
-        "Siste døgn": 86_400,
-        "Siste uke": 604_800,
-    }
-    if choice == "Siden 05:00 i dag":
-        return None, _today_at_0500_ts()
-    return age_options.get(choice), None
+    st.caption("⏱️ Filtrer på sist endret:")
+    age_cols = st.columns(6)
+    age_filter = None
+    since_filter = None
+
+    with age_cols[0]:
+        if st.button("🕐 Siste time", use_container_width=True, key=f"{key_prefix}_age_1h"):
+            age_filter = 3_600
+    with age_cols[1]:
+        if st.button("🕑 Siste 2 timer", use_container_width=True, key=f"{key_prefix}_age_2h"):
+            age_filter = 7_200
+    with age_cols[2]:
+        if st.button("🕓 Siste 4 timer", use_container_width=True, key=f"{key_prefix}_age_4h"):
+            age_filter = 14_400
+    with age_cols[3]:
+        if st.button("📅 Siste døgn", use_container_width=True, key=f"{key_prefix}_age_24h"):
+            age_filter = 86_400
+    with age_cols[4]:
+        if st.button("📆 Siste uke", use_container_width=True, key=f"{key_prefix}_age_7d"):
+            age_filter = 604_800
+    with age_cols[5]:
+        if st.button("🌅 Siden 05:00", use_container_width=True, key=f"{key_prefix}_since_0500"):
+            since_filter = _today_at_0500_ts()
+
+    return age_filter, since_filter
 
 
 if current_side == "a":
@@ -883,7 +885,11 @@ if current_side == "a":
 
 if current_side == "b":
     with tab_apply:
-        st.subheader("📥 Apply patch fra Side A")
+        st.subheader("📥 Mottak")
+        st.caption(
+            "Lim inn eller last opp innhold fra avsender. Code Mover identifiserer "
+            "automatisk om det er git patch, LLM patch eller full load."
+        )
 
         sync_state = load_sync_state(repo_root)
         last_sync  = sync_state.get("last_synced_commit")
@@ -901,10 +907,76 @@ if current_side == "b":
 
         st.divider()
 
+        with st.expander("📖 Instruks til LLM for å lage patch", expanded=False):
+            llm_instruction = "\n".join([
+                "Bruk LLM Patch Format for Code Mover.",
+                "",
+                "Viktig:",
+                "- Ikke send hele eksisterende filer.",
+                "- For eksisterende filer skal du sende små blokkendringer.",
+                "- Bruk FILE kun for nye filer.",
+                "- Bruk OVERWRITE bare hvis hele eksisterende fil eksplisitt skal erstattes.",
+                "- FIND-blokker må være eksakte og finnes nøyaktig én gang i filen.",
+                "- Ikke bruk \"... resten uendret\" eller andre forkortelser.",
+                "",
+                "Støttet format:",
+                "",
+                "1) Erstatt en eksisterende kodeblokk:",
+                "----====== PATCH: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "REPLACE:",
+                "<ny tekst>",
+                "",
+                "2) Sett inn etter en eksisterende blokk:",
+                "----====== INSERT_AFTER: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "INSERT:",
+                "<tekst som skal settes inn etter FIND-blokken>",
+                "",
+                "3) Sett inn før en eksisterende blokk:",
+                "----====== INSERT_BEFORE: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst>",
+                "",
+                "INSERT:",
+                "<tekst som skal settes inn før FIND-blokken>",
+                "",
+                "4) Slett en eksisterende blokk:",
+                "----====== DELETE_BLOCK: path/to/file.py",
+                "@@",
+                "FIND:",
+                "<eksakt eksisterende tekst som skal fjernes>",
+                "",
+                "5) Opprett ny fil:",
+                "----====== FILE: path/to/new_file.py",
+                "<hele innholdet i ny fil>",
+                "",
+                "6) Erstatt hel eksisterende fil, kun hvis eksplisitt nødvendig:",
+                "----====== OVERWRITE: path/to/existing_file.py",
+                "<hele filinnholdet>",
+                "",
+                "7) Slett fil:",
+                "----====== DELETE: path/to/file.py",
+                "",
+                "Når du lager patch:",
+                "- Bruk relative filstier.",
+                "- Del opp endringer i flere små operasjoner hvis det er tryggere.",
+                "- Velg FIND-blokker som er lange nok til å være unike.",
+                "- Hvis du ikke har nok kontekst til å lage en eksakt FIND-blokk, be om relevant utdrag av filen først.",
+            ])
+            st.code(llm_instruction, language="text")
+
         # ── Input method ────────────────────────────────────────────────
         input_method = st.radio(
-            "Inndatametode",
-            options=["📋 Lim inn tekst", "📦 Last opp ZIP", "💾 Last opp .patch-fil"],
+            "Hvordan vil du legge inn innholdet?",
+            options=["📋 Lim inn tekst", "📦 Last opp ZIP", "💾 Last opp fil"],
             horizontal=True,
         )
 
@@ -913,9 +985,9 @@ if current_side == "b":
 
         if input_method == "📋 Lim inn tekst":
             patch_text = st.text_area(
-                "patch",
+                "Mottaksinnhold",
                 height=300,
-                placeholder="Lim inn patch-tekst fra Side A her...",
+                placeholder="Lim inn git patch, LLM patch eller full load-tekst fra Side A her...",
                 label_visibility="collapsed",
             )
 
@@ -930,12 +1002,12 @@ if current_side == "b":
                 except Exception as e:
                     st.error(f"❌ {e}")
 
-        elif input_method == "💾 Last opp .patch-fil":
-            uploaded = st.file_uploader("Last opp .patch-fil", type=["patch", "txt"])
+        elif input_method == "💾 Last opp fil":
+            uploaded = st.file_uploader("Last opp tekstfil", type=["patch", "txt"])
             if uploaded:
                 try:
                     patch_text = uploaded.getvalue().decode("utf-8")
-                    st.success(f"✅ Patch-fil lastet inn ({len(patch_text)} tegn)")
+                    st.success(f"✅ Fil lastet inn ({len(patch_text)} tegn)")
                 except Exception as e:
                     st.error(f"❌ Kunne ikke lese fil: {e}")
 
@@ -971,7 +1043,69 @@ if current_side == "b":
                     "Sørg for at repoet er i git, slik at du kan se diff og rulle tilbake."
                 )
 
-                if st.button(
+                action_pattern = (
+                    r"^----======\s+"
+                    r"(FILE|OVERWRITE|DELETE|PATCH|INSERT_AFTER|INSERT_BEFORE|DELETE_BLOCK)"
+                    r":\s+(.+)$"
+                )
+                _blocks = re.split(action_pattern, patch_text, flags=re.MULTILINE)
+                operations = []
+                _i = 1
+                while _i < len(_blocks) - 2:
+                    action = _blocks[_i].strip().upper()
+                    fp = _blocks[_i + 1].strip()
+                    body = _blocks[_i + 2]
+                    if fp:
+                        operations.append({"action": action, "path": fp, "body": body})
+                    _i += 3
+
+                create_files = [op["path"] for op in operations if op["action"] == "FILE"]
+                overwrite_files = [op["path"] for op in operations if op["action"] == "OVERWRITE"]
+                delete_files = [op["path"] for op in operations if op["action"] == "DELETE"]
+                patch_files = [
+                    op["path"]
+                    for op in operations
+                    if op["action"] in {"PATCH", "INSERT_AFTER", "INSERT_BEFORE", "DELETE_BLOCK"}
+                ]
+
+                existing_create_files = [f for f in create_files if (repo_root / f).exists()]
+                missing_patch_files = [f for f in patch_files if not (repo_root / f).exists()]
+                missing_delete_files = [f for f in delete_files if not (repo_root / f).exists()]
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Blokk-endringer", len(patch_files))
+                col2.metric("Nye filer", len(create_files))
+                col3.metric("Overwrite", len(overwrite_files))
+                col4.metric("Slett", len(delete_files))
+
+                with st.expander("🔍 Operasjoner i patchen", expanded=True):
+                    for op in operations:
+                        exists = (repo_root / op["path"]).exists()
+                        exists_label = "finnes" if exists else "ny/mangler"
+                        st.write(f"• `{op['action']}` `{op['path']}` — {exists_label}")
+
+                ok_to_proceed = True
+                if existing_create_files:
+                    st.error("`FILE` kan bare brukes for nye filer. Disse filene finnes allerede:")
+                    for f in existing_create_files:
+                        st.write(f"• `{f}`")
+                    ok_to_proceed = False
+                if missing_patch_files:
+                    st.error("Disse blokk-endringene peker på filer som ikke finnes:")
+                    for f in missing_patch_files:
+                        st.write(f"• `{f}`")
+                    ok_to_proceed = False
+                if missing_delete_files:
+                    st.warning("Disse filene er markert for sletting, men finnes ikke:")
+                    for f in missing_delete_files:
+                        st.write(f"• `{f}`")
+                if overwrite_files:
+                    ok_to_proceed = st.checkbox(
+                        "Jeg forstår at `OVERWRITE` erstatter hele filer",
+                        key="apply_tab_llm_confirm_overwrite",
+                    ) and ok_to_proceed
+
+                if ok_to_proceed and st.button(
                     "🤖 Apply LLM patch",
                     type="primary",
                     use_container_width=True,
@@ -1154,7 +1288,23 @@ if current_side == "b":
 
             # ── GIT FORMAT-PATCH ─────────────────────────────────────────
             else:
+                st.info(
+                    "🧩 **Git format-patch detektert** — innholdet vil bli applisert "
+                    "med `git am` og beholder commit-historikk."
+                )
                 preview = preview_format_patch(patch_text)
+
+                existing_patch_files = [
+                    f for f in preview["files_changed"] if (repo_root / f).exists()
+                ]
+                new_patch_files = [
+                    f for f in preview["files_changed"] if not (repo_root / f).exists()
+                ]
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Commits", len(preview["commits"]))
+                col2.metric("Filer", len(preview["files_changed"]))
+                col3.metric("Nye/mangler lokalt", len(new_patch_files))
 
                 with st.expander("🔍 Forhåndsvis patch", expanded=True):
                     if preview["commits"]:
@@ -1164,6 +1314,14 @@ if current_side == "b":
                     if preview["files_changed"]:
                         st.write(f"**{len(preview['files_changed'])} fil(er) endres:**")
                         for f in preview["files_changed"]:
+                            st.write(f"• `{f}`")
+                    if existing_patch_files:
+                        st.write(f"**{len(existing_patch_files)} fil(er) finnes fra før:**")
+                        for f in existing_patch_files:
+                            st.write(f"• `{f}`")
+                    if new_patch_files:
+                        st.write(f"**{len(new_patch_files)} fil(er) finnes ikke lokalt nå:**")
+                        for f in new_patch_files:
                             st.write(f"• `{f}`")
 
                 st.divider()
@@ -1201,7 +1359,7 @@ if current_side == "b":
 # ═══════════════════════════════════════════════════════════════════════
 
 
-if current_side == "b":
+if False and current_side == "b":
     with tab_llm:
         st.subheader("🤖 LLM Patch — motta patch fra ChatGPT / annen LLM")
         st.caption(
@@ -1568,7 +1726,7 @@ if current_side == "a":
 # SIDE B — Full load (lim inn tekst og skriv filer)
 # ═══════════════════════════════════════════════════════════════════════
 
-if current_side == "b":
+if False and current_side == "b":
     with tab_load:
         st.subheader("📦 Full load — lim inn filer og overskriv")
         st.caption(
