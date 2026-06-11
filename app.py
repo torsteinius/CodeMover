@@ -727,6 +727,49 @@ def _filter_files_by_age(files: list[str], repo_root: Path, age_seconds: float) 
     return result
 
 
+def _filter_files_since(files: list[str], repo_root: Path, since_ts: float) -> list[str]:
+    """Return only files modified at or after ``since_ts``."""
+    result = []
+    for f in files:
+        full_path = repo_root / f
+        try:
+            if full_path.exists() and full_path.stat().st_mtime >= since_ts:
+                result.append(f)
+        except OSError:
+            pass
+    return result
+
+
+def _today_at_0500_ts() -> float:
+    return datetime.now().replace(hour=5, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _render_time_filter(key_prefix: str):
+    choice = st.selectbox(
+        "⏱️ Filtrer på sist endret:",
+        [
+            "Alle filer",
+            "Siste time",
+            "Siste 2 timer",
+            "Siste 4 timer",
+            "Siste døgn",
+            "Siste uke",
+            "Siden 05:00 i dag",
+        ],
+        key=f"{key_prefix}_time_filter",
+    )
+    age_options = {
+        "Siste time": 3_600,
+        "Siste 2 timer": 7_200,
+        "Siste 4 timer": 14_400,
+        "Siste døgn": 86_400,
+        "Siste uke": 604_800,
+    }
+    if choice == "Siden 05:00 i dag":
+        return None, _today_at_0500_ts()
+    return age_options.get(choice), None
+
+
 if current_side == "a":
     with tab_files:
         st.subheader("📁 Velg enkeltfiler å overføre")
@@ -754,22 +797,14 @@ if current_side == "a":
             st.stop()
 
         # ── Tidsfilter ──────────────────────────────────────────────────
-        st.caption("⏱️ Filtrer på sist endret:")
-        age_cols = st.columns([1, 1, 1, 4])
-        age_filter = None
-        with age_cols[0]:
-            if st.button("🕐 Siste time", use_container_width=True, key="ef_age_1h"):
-                age_filter = 3_600
-        with age_cols[1]:
-            if st.button("📅 Siste døgn", use_container_width=True, key="ef_age_24h"):
-                age_filter = 86_400
-        with age_cols[2]:
-            if st.button("📆 Siste uke", use_container_width=True, key="ef_age_7d"):
-                age_filter = 604_800
+        age_filter, since_filter = _render_time_filter("ef")
 
         display_files = changed_files
-        if age_filter is not None:
-            filtered = _filter_files_by_age(changed_files, repo_root, age_filter)
+        if age_filter is not None or since_filter is not None:
+            if since_filter is not None:
+                filtered = _filter_files_since(changed_files, repo_root, since_filter)
+            else:
+                filtered = _filter_files_by_age(changed_files, repo_root, age_filter)
             if len(filtered) < len(changed_files):
                 st.info(f"Viser {len(filtered)} av {len(changed_files)} fil(er) — {len(changed_files) - len(filtered)} eldre fil(er) skjult")
             # Auto-check all filtered files
@@ -1452,18 +1487,7 @@ if current_side == "a":
             st.stop()
 
         # ── Tidsfilter ──────────────────────────────────────────────────
-        st.caption("⏱️ Filtrer på sist endret:")
-        age_cols = st.columns([1, 1, 1, 4])
-        age_filter = None
-        with age_cols[0]:
-            if st.button("🕐 Siste time", use_container_width=True, key="fl_age_1h"):
-                age_filter = 3_600
-        with age_cols[1]:
-            if st.button("📅 Siste døgn", use_container_width=True, key="fl_age_24h"):
-                age_filter = 86_400
-        with age_cols[2]:
-            if st.button("📆 Siste uke", use_container_width=True, key="fl_age_7d"):
-                age_filter = 604_800
+        age_filter, since_filter = _render_time_filter("fl")
 
         # ── Filtrering ──────────────────────────────────────────────────
         filter_text = st.text_input("🔍 Filtrer filer", placeholder="f.eks. .py eller core/")
@@ -1472,8 +1496,11 @@ if current_side == "a":
         else:
             filtered = all_files
 
-        if age_filter is not None:
-            age_filtered = _filter_files_by_age(filtered, repo_root, age_filter)
+        if age_filter is not None or since_filter is not None:
+            if since_filter is not None:
+                age_filtered = _filter_files_since(filtered, repo_root, since_filter)
+            else:
+                age_filtered = _filter_files_by_age(filtered, repo_root, age_filter)
             if len(age_filtered) < len(filtered):
                 st.info(f"Viser {len(age_filtered)} av {len(filtered)} fil(er) — {len(filtered) - len(age_filtered)} eldre fil(er) skjult")
             # Auto-check all filtered files
